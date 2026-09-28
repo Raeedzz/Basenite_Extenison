@@ -265,7 +265,7 @@ export function syncHistoryDetail({
  * sync actually running?" is otherwise only answerable by reading extension
  * storage, which is not a thing to ask of anyone.
  */
-export function scheduleLabel({ enabled = true, timesPerDay = 12 } = {}) {
+export function scheduleLabel({ enabled = true, timesPerDay = 24 } = {}) {
   if (!enabled) return "Auto-sync off";
   const times = Math.max(1, Math.round(Number(timesPerDay) || 0));
   if (times === 1) return "Auto-syncs daily";

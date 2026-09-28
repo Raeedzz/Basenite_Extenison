@@ -5,7 +5,7 @@
  * bad alarm.
  */
 
-export const SOFT_SYNC_DEFAULT_TIMES_PER_DAY = 12;
+export const SOFT_SYNC_DEFAULT_TIMES_PER_DAY = 24;
 export const SOFT_SYNC_MIN_TIMES_PER_DAY = 1;
 export const SOFT_SYNC_MAX_TIMES_PER_DAY = 24;
 
@@ -54,4 +54,19 @@ export function normalizeSoftSyncPrefs(raw) {
 export function softSyncPeriodMinutes(prefs) {
   const { timesPerDay } = normalizeSoftSyncPrefs(prefs);
   return Math.max(1, Math.round((24 * 60) / timesPerDay));
+}
+
+/** How soon after the browser starts an overdue schedule catches up. */
+export const SOFT_SYNC_CATCH_UP_MINUTES = 10;
+
+/**
+ * Minutes until the first run of a freshly armed schedule. It keeps the cadence
+ * of the last sync, so a restart doesn't push the next run a full period out
+ * (a browser that's never open that long would never sync). An overdue run
+ * still waits a few minutes, never firing the moment the browser opens.
+ */
+export function softSyncFirstDelayMinutes(periodInMinutes, lastSyncAt, now = Date.now()) {
+  if (!Number.isFinite(lastSyncAt) || lastSyncAt > now) return periodInMinutes;
+  const due = periodInMinutes - (now - lastSyncAt) / 60_000;
+  return Math.min(periodInMinutes, Math.max(SOFT_SYNC_CATCH_UP_MINUTES, Math.ceil(due)));
 }

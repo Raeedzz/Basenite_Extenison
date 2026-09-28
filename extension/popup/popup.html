@@ -186,6 +186,22 @@
       </div>
       <button id="profile-add-btn" class="btn sm" type="button">Add</button>
       <button id="profile-mutuals-btn" class="btn sm ghost" type="button">Mutuals</button>
+      <button id="interaction-toggle" class="btn sm ghost hidden" type="button" aria-expanded="false" aria-controls="interaction-form">Log interaction</button>
+      <form id="interaction-form" class="interaction hidden" novalidate>
+        <div id="interaction-types" class="chips" role="group" aria-label="Interaction types"></div>
+        <label class="field">
+          <span class="eyebrow">When</span>
+          <input id="interaction-when" type="datetime-local" step="60" required />
+        </label>
+        <label class="field">
+          <span class="eyebrow">Note</span>
+          <textarea id="interaction-note" rows="2" placeholder="Optional"></textarea>
+        </label>
+        <div class="interaction-foot">
+          <p id="interaction-status" class="note" role="status" aria-live="polite"></p>
+          <button id="interaction-log-btn" class="btn sm primary" type="submit" disabled>Log</button>
+        </div>
+      </form>
     </section>
 
     <section class="list">

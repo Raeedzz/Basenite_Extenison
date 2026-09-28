@@ -19,6 +19,7 @@ import { readFileSync } from "node:fs";
 import {
   DEFAULT_SOFT_SYNC_PREFS,
   normalizeSoftSyncPrefs,
+  softSyncFirstDelayMinutes,
   softSyncPeriodMinutes,
 } from "../lib/soft-sync-prefs.js";
 import { bootWorker } from "./helpers/worker-harness.mjs";
@@ -46,19 +47,19 @@ function signIn(store) {
   store.set("airtable_config", airtableConfig());
 }
 
-test("soft sync ships on, twelve times a day", () => {
+test("soft sync ships on, hourly", () => {
   // Default-on is bounded by hasCompletedInitialSync rather than by the
   // preference: the schedule only ever refreshes a network the user already
   // imported, and never runs the first import unattended.
-  assert.deepEqual({ ...DEFAULT_SOFT_SYNC_PREFS }, { enabled: true, timesPerDay: 12 });
-  assert.equal(softSyncPeriodMinutes(DEFAULT_SOFT_SYNC_PREFS), 120);
+  assert.deepEqual({ ...DEFAULT_SOFT_SYNC_PREFS }, { enabled: true, timesPerDay: 24 });
+  assert.equal(softSyncPeriodMinutes(DEFAULT_SOFT_SYNC_PREFS), 60);
 });
 
 test("a malformed or out-of-range preference can never arm a bad alarm", () => {
   // Missing, wrong-typed, and fractional values all fall back to the default
   // rather than producing NaN or a zero-minute period.
   for (const raw of [undefined, null, "4", {}, { timesPerDay: "many" }, { timesPerDay: 2.5 }]) {
-    assert.equal(normalizeSoftSyncPrefs(raw).timesPerDay, 12, `bad input: ${JSON.stringify(raw)}`);
+    assert.equal(normalizeSoftSyncPrefs(raw).timesPerDay, 24, `bad input: ${JSON.stringify(raw)}`);
   }
   assert.equal(normalizeSoftSyncPrefs({ timesPerDay: 0 }).timesPerDay, 1);
   assert.equal(normalizeSoftSyncPrefs({ timesPerDay: -5 }).timesPerDay, 1);
@@ -86,6 +87,39 @@ test("re-arming an unchanged schedule leaves the pending run alone", () => {
   );
   // Disabling clears the alarm rather than leaving it firing into a no-op.
   assert.match(SOFT_SYNC_SOURCE, /if \(!normalized\.enabled\)[\s\S]{0,120}chrome\.alarms\.clear\(SOFT_SYNC_ALARM\)/);
+});
+
+test("a restart keeps the cadence of the last sync instead of starting the countdown over", () => {
+  const now = Date.parse("2026-09-28T12:00:00Z");
+  const minutesAgo = (minutes) => now - minutes * 60_000;
+  // Never synced: a full period (the run is skipped until the first sync anyway).
+  assert.equal(softSyncFirstDelayMinutes(60, NaN, now), 60);
+  // Synced 20 minutes ago, hourly: the next run is 40 minutes out, not 60.
+  assert.equal(softSyncFirstDelayMinutes(60, minutesAgo(20), now), 40);
+  // Overdue (Chrome was closed): catch up soon, but not the moment it opens.
+  assert.equal(softSyncFirstDelayMinutes(60, minutesAgo(300), now), 10);
+  assert.equal(softSyncFirstDelayMinutes(60, minutesAgo(55), now), 10);
+  // Just synced: a full period. A clock that says the sync is in the future: a full period.
+  assert.equal(softSyncFirstDelayMinutes(60, now, now), 60);
+  assert.equal(softSyncFirstDelayMinutes(60, now + 3_600_000, now), 60);
+  // A period shorter than the catch-up never waits longer than the period.
+  assert.equal(softSyncFirstDelayMinutes(5, minutesAgo(300), now), 5);
+});
+
+test("after a restart cleared the alarm, an overdue schedule is armed to catch up", async () => {
+  const lastSync = new Date(Date.now() - 5 * 3_600_000).toISOString();
+  const { calls, restore } = await bootWorker({ storage: {
+    earthos_soft_sync_prefs: { enabled: true, timesPerDay: 24 },
+    capture_results: { site: "linkedin", total: 3, completedAt: lastSync },
+    earthos_initial_sync_done: lastSync,
+  } });
+  try {
+    const armed = calls.filter(([name, [alarm]]) => name === "alarms.create" && alarm === "earthos-soft-sync");
+    assert.equal(armed.length, 1);
+    assert.deepEqual(armed[0][1][1], { periodInMinutes: 60, delayInMinutes: 10 });
+  } finally {
+    restore();
+  }
 });
 
 test("a scheduled run never competes with work already in flight", () => {

@@ -22,6 +22,7 @@
 import {
   DEFAULT_SOFT_SYNC_PREFS,
   normalizeSoftSyncPrefs,
+  softSyncFirstDelayMinutes,
   softSyncPeriodMinutes,
 } from "../lib/soft-sync-prefs.js";
 
@@ -66,10 +67,21 @@ export async function armSoftSyncAlarm(prefs) {
   if (existing?.periodInMinutes === periodInMinutes) return;
   await chrome.alarms.create(SOFT_SYNC_ALARM, {
     periodInMinutes,
-    // First run a full period from now — never immediately on browser start,
-    // which is when the user is least expecting background LinkedIn traffic.
-    delayInMinutes: periodInMinutes,
+    // A period after the last real sync, so a restart (which can clear alarms)
+    // doesn't reset the countdown; an overdue one catches up a few minutes in.
+    delayInMinutes: softSyncFirstDelayMinutes(periodInMinutes, await lastRealSyncAt()),
   });
+}
+
+/** When the last non-test LinkedIn sync finished, manual or scheduled; NaN if never. */
+async function lastRealSyncAt() {
+  const stored = await chrome.storage.local.get(["capture_results", "earthos_initial_sync_done"]).catch(() => ({}));
+  const result = stored?.capture_results;
+  const latest = result?.site === "linkedin" && result.sample !== true
+    ? Date.parse(result.completedAt) || Number(result.timestamp)
+    : NaN;
+  const durable = Date.parse(stored?.earthos_initial_sync_done);
+  return Math.max(Number.isFinite(latest) ? latest : -Infinity, Number.isFinite(durable) ? durable : -Infinity);
 }
 
 /** Make sure the alarm matches the stored preference (extension updates clear alarms). */

@@ -47,9 +47,12 @@ People extras:
 | Sync LinkedIn network | every 1st-degree connection + full profile, message metadata |
 | Quick refresh / automatic soft sync | re-walks connections; only people not yet in the table get the profile pass |
 | This profile → Add to Airtable | the LinkedIn profile open in the active tab |
+| This profile → Log interaction | one **Interactions** row (types, when, person) and, if a note was typed, one **Notes** row it links; adds the person to People first if they aren't there |
 | People at a company | current employees (optionally by role keywords), enriched |
 | Search LinkedIn → Add selected | picked search results, enriched |
 | Find mutuals | mutual-connection count + names onto each target's row |
+
+Log interaction needs the base's **Interactions** and **Notes** tables (Basanite OS layout) linked to the People table; the button only shows when they're there. Tables added later are picked up on the next soft sync (or **Reload columns**). It is create-only: it never edits or deletes an interaction or note. Types must already be options on the Types column. If the interaction fails after its note was saved, **Retry** links that same note instead of writing another; a write that timed out is looked up before it is sent again.
 
 ## How writes work
 
@@ -58,7 +61,7 @@ People extras:
 - Empty captured values never blank a cell. `Source` is set on create only.
 - Rows deleted in Airtable are recreated on the next full sync.
 - Requests are paced under Airtable's 5 req/s limit; 429/5xx/network drops are retried.
-- Soft sync defaults to 12×/day and only starts after your first manual full sync. Change it on the Capture tab.
+- Soft sync defaults to hourly (24×/day) and only starts after your first manual full sync. Change it on the Capture tab. Runs only while Chrome is open; after a restart the schedule picks up from your last sync, and an overdue one runs about 10 minutes after Chrome opens. Every soft sync (scheduled or Quick refresh) re-reads the base's tables and columns first.
 
 ## Layout
 

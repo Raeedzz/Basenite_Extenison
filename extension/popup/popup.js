@@ -1,4 +1,5 @@
 import { canMap, canonicalLinkedinUrl, SOURCE_FIELDS, suggestMapping } from "../lib/airtable-fields.js";
+import { INTERACTION_TYPES, interactionTables } from "../lib/airtable-interactions.js";
 import { canPlay, LINKED_TABLES, PEOPLE_LINKS } from "../lib/airtable-linked.js";
 import {
   formatCount,
@@ -41,6 +42,18 @@ let errorAction = null;
 let errorFromStart = false;
 // A paused bulk enrich; it can be resumed from where it stopped.
 let bulkJob = null;
+
+// Log interaction.
+// Types in the order they were picked; the summary reads in that order.
+let picked = [];
+let whenTouched = false;
+let logging = false;
+let lastLogFailed = false;
+// A note that landed before its interaction failed: Retry links it, never writes another.
+let pendingNoteId = null;
+// The time a failed log was sent with: Retry keeps it, so the interaction matches its note.
+let failedAt = null;
+let statusTimer = null;
 
 /** A worker call; answers carrying `error` throw it. */
 async function send(type, payload = {}) {
@@ -811,6 +824,7 @@ const captureButtons = [
 function setCaptureEnabled() {
   for (const button of captureButtons) button.disabled = !ready() || busy;
   renderBulkCount();
+  renderInteraction();
 }
 
 async function start(line, type, payload, retry) {
@@ -906,12 +920,15 @@ let activeProfileUrl = null;
 
 async function readActiveProfile() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+  const previous = activeProfileUrl;
   activeProfileUrl = linkedinProfileUrl(tab?.url || "");
   $("profile-card").classList.toggle("hidden", !activeProfileUrl);
   if (activeProfileUrl) {
     const name = String(tab.title || "").replace(/^\(\d+\)\s*/, "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
     $("profile-name").textContent = name || activeProfileUrl;
   }
+  if (activeProfileUrl !== previous && !logging) resetInteraction();
+  renderInteraction();
 }
 
 chrome.tabs.onActivated.addListener(() => void readActiveProfile());
@@ -925,6 +942,125 @@ $("profile-add-btn").addEventListener("click", () => {
 });
 $("profile-mutuals-btn").addEventListener("click", () => {
   if (activeProfileUrl) startMutuals([activeProfileUrl]);
+});
+
+// ─── Log interaction ─────────────────────────────────────────────────────────
+
+function localMinute(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function interactionStatus(text, kind = "") {
+  clearTimeout(statusTimer);
+  const status = $("interaction-status");
+  status.textContent = text;
+  status.classList.toggle("error", kind === "error");
+  status.classList.toggle("done", kind === "done");
+  if (kind === "done") statusTimer = setTimeout(() => interactionStatus(""), 4000);
+}
+
+for (const type of INTERACTION_TYPES) {
+  const chip = document.createElement("button");
+  chip.type = "button";
+  chip.className = "chip";
+  chip.textContent = type;
+  chip.dataset.type = type;
+  chip.setAttribute("aria-pressed", "false");
+  chip.addEventListener("click", () => {
+    picked = picked.includes(type) ? picked.filter((each) => each !== type) : [...picked, type];
+    renderInteraction();
+  });
+  $("interaction-types").append(chip);
+}
+
+function resetInteraction() {
+  picked = [];
+  whenTouched = false;
+  lastLogFailed = false;
+  pendingNoteId = null;
+  failedAt = null;
+  $("interaction-note").value = "";
+  $("interaction-when").value = localMinute();
+  interactionStatus("");
+}
+
+function renderInteraction() {
+  const tables = ready() ? interactionTables(config.baseTables, config.tableId) : { interactions: false, notes: false };
+  $("interaction-toggle").classList.toggle("hidden", !tables.interactions);
+  if (!tables.interactions) {
+    $("interaction-form").classList.add("hidden");
+    $("interaction-toggle").setAttribute("aria-expanded", "false");
+  }
+  $("interaction-note").closest(".field").classList.toggle("hidden", !tables.notes && !pendingNoteId);
+  for (const chip of $("interaction-types").children) {
+    chip.setAttribute("aria-pressed", String(picked.includes(chip.dataset.type)));
+    chip.disabled = logging;
+  }
+  // A saved note already carries the time; the interaction must match it.
+  $("interaction-when").disabled = logging || Boolean(pendingNoteId);
+  $("interaction-note").disabled = logging || Boolean(pendingNoteId);
+  const button = $("interaction-log-btn");
+  button.disabled = logging || picked.length === 0 || !activeProfileUrl;
+  button.textContent = logging ? "Logging…" : pendingNoteId ? "Retry" : "Log";
+}
+
+$("interaction-toggle").addEventListener("click", () => {
+  const form = $("interaction-form");
+  const open = form.classList.contains("hidden");
+  form.classList.toggle("hidden", !open);
+  $("interaction-toggle").setAttribute("aria-expanded", String(open));
+  if (open) {
+    if (!whenTouched) $("interaction-when").value = localMinute();
+    $("interaction-types").querySelector(".chip")?.focus();
+  }
+});
+
+$("interaction-when").addEventListener("input", () => {
+  whenTouched = Boolean($("interaction-when").value);
+});
+
+$("interaction-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (logging || picked.length === 0 || !activeProfileUrl) return;
+  // Untouched means now, at the moment of the click (or of the try that failed).
+  const when = whenTouched ? new Date($("interaction-when").value) : failedAt ? new Date(failedAt) : new Date();
+  if (Number.isNaN(when.getTime())) {
+    interactionStatus("Pick when it happened.", "error");
+    return;
+  }
+  logging = true;
+  interactionStatus("");
+  renderInteraction();
+  const url = activeProfileUrl;
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({
+      type: "LOG_INTERACTION",
+      url,
+      name: $("profile-name").textContent,
+      types: picked,
+      at: when.toISOString(),
+      note: $("interaction-note").value,
+      noteId: pendingNoteId,
+      retry: lastLogFailed,
+    });
+  } catch (error) {
+    response = { error: error.message };
+  }
+  logging = false;
+  if (response?.ok) {
+    resetInteraction();
+    interactionStatus("Logged", "done");
+  } else {
+    lastLogFailed = true;
+    failedAt = when.toISOString();
+    pendingNoteId = response?.noteId || pendingNoteId;
+    const detail = plainError(response?.error || "Couldn't log it.").trim().replace(/([^.!?])$/, "$1.");
+    interactionStatus(pendingNoteId ? `${detail} The note was saved; Retry logs the interaction with it.` : detail, "error");
+  }
+  if (url !== activeProfileUrl) resetInteraction();
+  renderInteraction();
 });
 
 $("company-btn").addEventListener("click", () => {

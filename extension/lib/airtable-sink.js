@@ -248,16 +248,20 @@ function memberIndex() {
  * by a teammate's extension or by hand. Ask Airtable for their LinkedIn URLs
  * (a loose FIND, confirmed here by slug) and adopt any row it finds.
  */
+function peopleFormula(keyField, keys) {
+  const quote = (text) => `"${text.replace(/["\\]/g, "\\$&")}"`;
+  const needles = [...new Set(keys.flatMap((key) => [key, encodeURIComponent(key).toLowerCase()]))];
+  // By field id: a column renamed since the schema was read still resolves.
+  return `OR(${needles.map((needle) => `FIND(${quote(`/in/${needle}`)}, LOWER({${keyField}}))`).join(",")})`;
+}
+
 async function adoptAddedRows(config, keys, writeStartedAt) {
   // Only an index read during this very write already knows the whole table.
   if (!keys.length || state.indexedAt >= writeStartedAt) return 0;
   const keyField = config.mapping.linkedinUrl;
-  const quote = (text) => `"${text.replace(/["\\]/g, "\\$&")}"`;
   let adopted = 0;
   for (const group of chunk(keys, RECORDS_PER_REQUEST)) {
-    const needles = [...new Set(group.flatMap((key) => [key, encodeURIComponent(key).toLowerCase()]))];
-    // By field id: a column renamed since the schema was read still resolves.
-    const formula = `OR(${needles.map((needle) => `FIND(${quote(`/in/${needle}`)}, LOWER({${keyField}}))`).join(",")})`;
+    const formula = peopleFormula(keyField, group);
     let records;
     try {
       records = await listRecords(config.token, config.baseId, config.tableId, { fieldIds: [keyField], formula });
@@ -953,6 +957,31 @@ export async function knownPeople(rows) {
   return rows.map((row) => {
     const key = linkedinKey(canonicalLinkedinUrl(row?.linkedinUrl) || "");
     return Boolean(key && state.rows.get(key)?.r);
+  });
+}
+
+/**
+ * This person's People row, asked of Airtable itself (a teammate's row counts,
+ * a deleted one doesn't): { id, name } or null. Read-only.
+ */
+export function findPersonRecord(linkedinUrl) {
+  return queue(async () => {
+    const config = await requireConfig();
+    const key = linkedinKey(canonicalLinkedinUrl(linkedinUrl) || "");
+    if (!key) return null;
+    await loadState(config);
+    const keyField = config.mapping.linkedinUrl;
+    const nameField = config.mapping.name || null;
+    const records = await listRecords(config.token, config.baseId, config.tableId, {
+      fieldIds: [keyField, nameField].filter(Boolean),
+      formula: peopleFormula(keyField, [key]),
+    });
+    const matches = records.filter((record) => linkedinKey(record.fields?.[keyField]) === key);
+    const known = state.rows.get(key)?.r;
+    const record = matches.find((match) => match.id === known) || matches[0];
+    if (!record) return null;
+    const name = nameField ? record.fields?.[nameField] : null;
+    return { id: record.id, name: typeof name === "string" && name.trim() ? name.trim() : null };
   });
 }
 

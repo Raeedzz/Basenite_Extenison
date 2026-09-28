@@ -38,9 +38,11 @@ import {
   suggestLinked,
   suggestPeopleTable,
 } from "../lib/airtable-linked.js";
+import { interactionEntry, interactionTables, logInteraction } from "../lib/airtable-interactions.js";
 import {
   clearConfig,
   configProblem,
+  findPersonRecord,
   forgetTableState,
   indexedPeopleCount,
   LAST_WRITE_KEY,
@@ -619,6 +621,7 @@ async function runScheduledSoftSync() {
     await recordSoftSyncRun({ skipped: "linkedin_signed_out" });
     return;
   }
+  await refreshSchemaQuietly();
   const runId = crypto.randomUUID();
   LOG(`Starting scheduled soft sync ${runId}`);
   await recordSoftSyncRun({ started: true, runId });
@@ -631,6 +634,18 @@ async function runScheduledSoftSync() {
  * stays "in_progress" forever and the side panel spins with no way out. A
  * fresh worker has no such run by definition, so settle the stale entries.
  */
+/**
+ * Re-read the base's tables and columns, as Reload columns does, so a table
+ * or column added in Airtable (Interactions, Notes) shows up without it.
+ * Skipped while a run is writing; a failure keeps the last schema.
+ */
+async function refreshSchemaQuietly() {
+  if (linkedInBusy()) return;
+  const config = await readConfig().catch(() => ({}));
+  if (!config.token || !config.baseId || !config.tableId) return;
+  await refreshSchema(config).catch((error) => LOG(`Schema refresh skipped: ${error?.message || error}`));
+}
+
 async function reconcileOrphanedGraphRuns() {
   if (isGraphTaskRunning()) return;
   const { mutual_progress: mutual, company_progress: company } =
@@ -794,6 +809,9 @@ async function handleMessage(message) {
 
     case "CAPTURE_PROFILES":
       return handleCaptureProfiles(message.urls);
+
+    case "LOG_INTERACTION":
+      return handleLogInteraction(message);
 
     case "BULK_ENRICH":
       return handleBulkEnrich(message.urls);
@@ -1249,6 +1267,7 @@ async function handleStartCapture(site, { force = false, mode = "full", sampleLi
     await releaseLinkedInCapture(lock.runId);
   }
 
+  if (mode === "soft") await refreshSchemaQuietly();
   // Requested, therefore visible — a soft sync the user asked for still gets a
   // progress bar, unlike the scheduled one that shares its depth.
   return startLinkedInCapture(crypto.randomUUID(), { mode, silent: false, sampleLimit });
@@ -1530,7 +1549,53 @@ async function handleCaptureProfiles(urls) {
     failed: tally.failed + enriched.failedUrls.length,
     failedUrls: enriched.failedUrls,
     warning: tally.errors[0] || null,
+    profiles: enriched.profiles.map(({ linkedinUrl, name }) => ({ linkedinUrl, name })),
   };
+}
+
+// ─── Log interaction ─────────────────────────────────────────────────────────
+
+/**
+ * One Interactions row (and a Notes row for a note) for the open profile. A
+ * person not in People yet is added first, the same way Add does it.
+ */
+async function handleLogInteraction(message) {
+  const url = safeLinkedInProfileUrl(message.url);
+  if (!url) return { error: "Open a LinkedIn profile first." };
+  const config = await readConfig();
+  const problem = configProblem(config);
+  if (problem) return { error: problem };
+  const tables = interactionTables(config.baseTables, config.tableId);
+  if (!tables.interactions) return { error: "This base has no Interactions table to log to. Reload columns in Settings." };
+  let entry;
+  try {
+    entry = interactionEntry(message);
+  } catch (error) {
+    return { error: error.message };
+  }
+  const noteId = typeof message.noteId === "string" && /^rec[A-Za-z0-9]{14}$/.test(message.noteId) ? message.noteId : null;
+  if (entry.note && !noteId && !tables.notes) return { error: "This base has no Notes table for the note. Reload columns in Settings." };
+  try {
+    let person = await findPersonRecord(url);
+    let name = null;
+    if (!person) {
+      if (linkedInBusy()) return { error: "They aren't in People yet, and a capture is running. Try again when it's done." };
+      const added = await handleCaptureProfiles([url]);
+      if (added.error) return { error: added.error };
+      const profile = added.profiles?.[0];
+      name = profile?.name || null;
+      person = await findPersonRecord(profile?.linkedinUrl || url);
+      if (!person) return { error: added.warning || "Couldn't add them to People." };
+    }
+    const fallback = typeof message.name === "string" && message.name.trim() ? message.name.trim().slice(0, 200) : "LinkedIn member";
+    const result = await logInteraction(config, {
+      ...entry, personId: person.id, name: person.name || name || fallback, noteId, retry: message.retry === true,
+    });
+    return { ok: true, ...result };
+  } catch (error) {
+    ERR("Log interaction failed:", error?.message || error);
+    return { error: error?.message || String(error), noteId: error?.noteId || noteId };
+  }
 }
 
 // ─── Bulk enrich ─────────────────────────────────────────────────────────────
