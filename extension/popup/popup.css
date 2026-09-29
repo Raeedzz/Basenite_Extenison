@@ -194,7 +194,7 @@ summary:focus-visible, .switch:focus-visible {
   outline-offset: 2px;
 }
 
-input[type="text"], input[type="search"], input[type="password"], textarea, select {
+input[type="text"], input[type="search"], input[type="password"], input[type="number"], textarea, select {
   width: 100%;
   min-width: 0;
   height: 32px;
@@ -351,6 +351,7 @@ input::placeholder, textarea::placeholder { color: var(--ink-faint); }
 .switch-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .switch-row label { flex: 1; font-weight: 500; }
 .switch-row select { width: auto; height: 28px; font-size: 12px; }
+.switch-row input[type="number"] { width: 64px; height: 28px; font-size: 12px; }
 
 .switch {
   appearance: none;

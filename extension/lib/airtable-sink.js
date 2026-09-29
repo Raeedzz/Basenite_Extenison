@@ -61,6 +61,10 @@ export const CONFIG_KEY = "airtable_config";
 export const LAST_WRITE_KEY = "airtable_last_write";
 const ROWS_PREFIX = "airtable_rows";
 const BUCKETS = 32;
+// Photos used to go to Airtable as LinkedIn URLs, and Airtable dropped most of
+// them after the write. Marks from then say "sent" over blank cells, so they're
+// cleared once: each photo is checked against its cell at that person's next sync.
+const PHOTO_MARKS = 2;
 
 const SCHEMA_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 // Set while a write is sending; still set at the next write means it was cut off.
@@ -212,6 +216,15 @@ async function loadState(config) {
     for (const [person, row] of Object.entries(stored[key] || {})) rows.set(person, row);
   }
   state = { table, rows, indexedAt: Number(stored[metaKey]?.indexedAt) || 0, dirty: new Set() };
+  if (stored[metaKey]?.photos !== PHOTO_MARKS) {
+    for (const [person, row] of rows) {
+      if (!row.h?.photo) continue;
+      const { photo, ...hashes } = row.h;
+      rows.set(person, { ...row, h: hashes });
+      state.dirty.add(bucketOf(person));
+    }
+    state.dirty.add(0);
+  }
   return state;
 }
 
@@ -228,7 +241,7 @@ async function persist() {
   if (!state || state.dirty.size === 0) return;
   const buckets = Array.from({ length: BUCKETS }, () => ({}));
   for (const [person, row] of state.rows) buckets[bucketOf(person)][person] = row;
-  const writes = { [`${ROWS_PREFIX}:${state.table}:meta`]: { indexedAt: state.indexedAt } };
+  const writes = { [`${ROWS_PREFIX}:${state.table}:meta`]: { indexedAt: state.indexedAt, photos: PHOTO_MARKS } };
   for (const bucket of state.dirty) writes[bucketKey(state.table, bucket)] = buckets[bucket];
   state.dirty.clear();
   await chrome.storage.local.set(writes);
@@ -532,7 +545,9 @@ async function sendCreates(config, items, tally, attempt = 0) {
         for (const item of group) {
           const landed = state.rows.get(item.key)?.r;
           if (landed) {
-            setRow(item.key, { r: landed, h: item.hashes, ...(item.memberId ? { m: item.memberId } : {}) });
+            // Its photo upload never ran: leave it unsent, for the next sync.
+            const { photo, ...hashes } = item.hashes;
+            setRow(item.key, { r: landed, h: hashes, ...(item.memberId ? { m: item.memberId } : {}) });
             tally.created++;
             if (heldBack.has(item)) followUps.push({ item, id: landed, fields: heldBack.get(item) });
           } else {
@@ -557,7 +572,9 @@ async function sendCreates(config, items, tally, attempt = 0) {
 }
 
 async function sendUpdates(config, items, tally, byId) {
-  for (const group of chunk(items, RECORDS_PER_REQUEST)) {
+  // Read as gone just now: a photo-only update sends no PATCH to hear the 404 from.
+  for (const item of items.filter((candidate) => candidate.gone)) await recreate(config, item, tally, byId);
+  for (const group of chunk(items.filter((item) => !item.gone), RECORDS_PER_REQUEST)) {
     try {
       const split = group.map((item) => ({ item, ...splitChoices(config, item) }));
       const sendable = split.filter(({ now }) => Object.keys(now).length);
@@ -612,16 +629,18 @@ async function sendUpdates(config, items, tally, byId) {
         tally.errors.push(error.message);
         continue;
       }
-      // Deleted in Airtable since the index was built: recreate the row, the
-      // same way any new person is created.
-      const plan = planCells(item.person, config.mapping, byId, null);
-      await dropBrokenImages([plan], [photoField(config)], () => delete plan.hashes.photo);
-      const memberId = state.rows.get(item.key)?.m || item.person.memberId || null;
-      state.rows.delete(item.key);
-      await sendCreates(config, [{ key: item.key, fields: plan.fields, hashes: plan.hashes, person: item.person, memberId }], tally);
+      await recreate(config, item, tally, byId);
     }
   }
   return tally;
+}
+
+/** Deleted in Airtable since the index was built: recreate the row, the same way any new person is created. */
+async function recreate(config, item, tally, byId) {
+  const plan = planCells(item.person, config.mapping, byId, null);
+  const memberId = state.rows.get(item.key)?.m || item.person.memberId || null;
+  state.rows.delete(item.key);
+  await sendCreates(config, [{ key: item.key, fields: plan.fields, hashes: plan.hashes, person: item.person, memberId }], tally);
 }
 
 // On an existing person, every column the extension doesn't own fills blanks
@@ -765,7 +784,10 @@ async function reconcileUpdates(config, items) {
   }
   for (const item of needs) {
     const now = current.get(item.id);
-    if (!now) continue; // Gone: sendUpdates recreates it.
+    if (!now) {
+      item.gone = true; // sendUpdates recreates it.
+      continue;
+    }
     for (const key of FILL_KEYS) {
       const fieldId = config.mapping[key];
       if (!fieldId || !(fieldId in item.fields)) continue;
@@ -899,12 +921,11 @@ export function writePeople(rows, { source = null, degree = null } = {}) {
         }
       }
 
-      // A photo that won't download is left out, and tried again next sync.
-      const photo = photoField(config);
-      await dropBrokenImages(creates, [photo], (item) => delete item.hashes.photo);
+      // A photo that won't download or upload is tried again next sync (forgetFailedPhotos).
       await sendCreates(config, creates, tally);
       await reconcileUpdates(config, updates);
-      await dropBrokenImages(updates, [photo], (item) => {
+      // Checked first on an update, so a dead photo doesn't send a timestamp-only write every sync.
+      await dropBrokenImages(updates, [photoField(config)], (item) => {
         if (item.previous?.photo) item.hashes.photo = item.previous.photo;
         else delete item.hashes.photo;
       });
@@ -957,6 +978,24 @@ export async function knownPeople(rows) {
   return rows.map((row) => {
     const key = linkedinKey(canonicalLinkedinUrl(row?.linkedinUrl) || "");
     return Boolean(key && state.rows.get(key)?.r);
+  });
+}
+
+/**
+ * People rows for these LinkedIn URLs, person key → record id: the index, plus
+ * a lookup in Airtable for anyone it lacks (a teammate's row, one added by
+ * hand). Read-only; someone in neither is left out.
+ */
+export function peopleRecordIds(urls) {
+  return queue(async () => {
+    const startedAt = Date.now();
+    const config = await requireConfig();
+    await loadState(config);
+    if (Date.now() - state.indexedAt > INDEX_MAX_AGE_MS) await rebuildIndex(config);
+    const keys = [...new Set(urls.map(linkedinKey).filter(Boolean))];
+    await adoptAddedRows(config, keys.filter((key) => !state.rows.get(key)?.r), startedAt);
+    await persist();
+    return new Map(keys.filter((key) => state.rows.get(key)?.r).map((key) => [key, state.rows.get(key).r]));
   });
 }
 

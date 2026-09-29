@@ -21,7 +21,6 @@ import {
   updateRecords,
 } from "./airtable-client.js";
 import { attachmentFor, cellValue, fingerprint, imageExpired, imageUrl, normalizeName } from "./airtable-fields.js";
-import { dropBrokenImages } from "./image-check.js";
 import {
   linkedinPath,
   linkedinUrlFor,
@@ -541,8 +540,7 @@ async function resolveShared(config, kind, entities, tally) {
     creates.push({ entity, keys: [entity.key], path, name, values, fields: cells(part, values) });
   }
 
-  // A logo that won't download is left out; the blank Logo is tried again next sync.
-  await dropBrokenImages(creates, [part.fields.logo]);
+  // A logo that won't download or upload stays blank, and is tried again next sync.
   await create(config, part, creates, (item, recordId) => {
     const entry = {
       n: normalizeName(item.values.name),
@@ -576,7 +574,6 @@ async function resolveShared(config, kind, entities, tally) {
       }
     }
   }
-  await dropBrokenImages(patches, [part.fields.logo]);
   const toPatch = patches.filter((item) => Object.keys(item.fields).length);
   await update(config, part, toPatch, (item) => {
     const entry = store.get(item.id);

@@ -5,6 +5,7 @@
  */
 
 import { captureCompanyPeople, captureMutualConnections, getToken } from "../lib/api-client.js";
+import { mutualsLine } from "../lib/airtable-mutuals.js";
 import { setCompanyProgress, setMutualProgress } from "./capture-state.js";
 
 const LOG = (...args) => console.log("[EarthOS:Heart:BG]", ...args);
@@ -43,7 +44,11 @@ export async function saveBridgeResults(results) {
       unresolved: response?.unresolved || 0,
       totalBridges,
       people: Array.isArray(response?.mutualPeople) ? response.mutualPeople : [],
-      message: `Found ${totalBridges} mutual connection${totalBridges === 1 ? "" : "s"} across ${results.length} contact${results.length === 1 ? "" : "s"}`,
+      message: response?.mutuals?.error
+        ? `Mutuals: couldn't save pairs (${response.mutuals.error})`
+        : response?.mutuals
+          ? mutualsLine(response.mutuals)
+          : `Found ${totalBridges} mutual connection${totalBridges === 1 ? "" : "s"} across ${results.length} contact${results.length === 1 ? "" : "s"}`,
     });
 
     LOG(`Mutuals capture complete: ${totalBridges} bridges across ${results.length} contacts`);

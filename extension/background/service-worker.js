@@ -94,6 +94,7 @@ import {
   startEnrichmentRun,
 } from "./linkedin-capture.js";
 import { setCompanyDetailsProvider, setLinkedProgressHook } from "../lib/airtable-linked-sync.js";
+import { readMutualPrefs } from "../lib/mutual-prefs.js";
 import {
   cancelCompanyCapture,
   captureCompany,
@@ -1452,7 +1453,7 @@ async function handleStartMutualFinding(contacts) {
 
   try {
     await armRunAlarms();
-    const response = await findBridges(targets);
+    const response = await findBridges(targets, { maxBridges: (await readMutualPrefs()).maxPerProfile });
     if (response?.error) {
       await setMutualProgress({ status: "error", message: response.error });
       return { error: response.error };

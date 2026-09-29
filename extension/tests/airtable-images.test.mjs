@@ -64,9 +64,9 @@ function setup(records = {}, { broken = [] } = {}) {
     schemaAt: Date.now(),
   });
   const checked = [];
-  images.setImageChecker(async (url) => {
+  images.setImageFetcher(async (url) => {
     checked.push(url);
-    return !broken.some((part) => url.includes(part));
+    return broken.some((part) => url.includes(part)) ? null : { contentType: "image/jpeg", bytes: new TextEncoder().encode(url) };
   });
   const asked = [];
   details = {};
@@ -235,7 +235,7 @@ test("a logo that won't download is skipped without failing the company", async 
   const basanite = base.rows(COMPANIES).find((row) => row.fields[C.name] === "Basanite");
   assert.equal(basanite.fields[C.logo], undefined);
   assert.equal(basanite.fields["fldCLrrYTiMG8nrxo"], "Seed fund.", "the rest of the company didn't land");
-  images.setImageChecker(null);
+  images.setImageFetcher(null);
 });
 
 test("only LinkedIn's image CDN is ever checked or handed to Airtable", () => {

@@ -9,8 +9,10 @@
  */
 
 import { computeBackoffMs, parseRetryAfter } from "./import-protocol.js";
+import { fetchImage } from "./image-check.js";
 
 export const AIRTABLE_API = "https://api.airtable.com/v0";
+export const AIRTABLE_CONTENT_API = "https://content.airtable.com/v0";
 export const RECORDS_PER_REQUEST = 10;
 
 const LOG = (...args) => console.log("[Airtable]", ...args);
@@ -75,8 +77,8 @@ function describe(status, body) {
   return { type, message: detail || `Airtable returned ${status}.` };
 }
 
-async function once(token, path, { method = "GET", body, query } = {}) {
-  const url = new URL(`${AIRTABLE_API}${path}`);
+async function once(token, path, { method = "GET", body, query, origin = AIRTABLE_API } = {}) {
+  const url = new URL(`${origin}${path}`);
   for (const [key, value] of Object.entries(query || {})) {
     if (value === undefined || value === null) continue;
     for (const item of Array.isArray(value) ? value : [value]) url.searchParams.append(key, String(item));
@@ -233,21 +235,111 @@ export async function listRecords(token, baseId, tableId, { fieldIds = [], formu
  * `typecast` off, select values must be existing choices exactly.
  */
 export async function createRecords(token, baseId, tableId, records, { typecast = true } = {}) {
+  const { sent, uploads } = takeUploads(records);
   const data = await airtableRequest(token, tablePath(baseId, tableId), {
     method: "POST",
-    body: { records, typecast, returnFieldsByFieldId: true },
+    body: { records: sent, typecast, returnFieldsByFieldId: true },
     blindRetry: false,
   });
-  return withDetails(data);
+  return withUploads(token, baseId, data, uploads);
 }
 
 /** Up to RECORDS_PER_REQUEST records: [{ id, fields }] → updated records. */
 export async function updateRecords(token, baseId, tableId, records, { typecast = true } = {}) {
-  const data = await airtableRequest(token, tablePath(baseId, tableId), {
-    method: "PATCH",
-    body: { records, typecast, returnFieldsByFieldId: true },
+  const { sent, uploads } = takeUploads(records);
+  const changed = sent.filter((record) => Object.keys(record.fields || {}).length);
+  const data = changed.length
+    ? await airtableRequest(token, tablePath(baseId, tableId), {
+      method: "PATCH",
+      body: { records: changed, typecast, returnFieldsByFieldId: true },
+    })
+    : {};
+  // A record that only had images to add isn't sent; it answers as itself.
+  const byId = new Map((data.records || []).map((record) => [record.id, record]));
+  return withUploads(token, baseId, { ...data, records: sent.map((record) => byId.get(record.id) || { id: record.id, fields: {} }) }, uploads);
+}
+
+// ─── Images ──────────────────────────────────────────────────────────────────
+
+const LINKEDIN_IMAGE = /^https:\/\/([a-z0-9-]+\.)*licdn\.com\//i;
+
+/** An attachment cell of LinkedIn images: [{ url, filename? }]. */
+function linkedinImages(value) {
+  return Array.isArray(value) && value.length > 0
+    && value.every((item) => item && typeof item === "object" && LINKEDIN_IMAGE.test(String(item.url || "")));
+}
+
+/**
+ * LinkedIn images come out of the write and are uploaded by their bytes after
+ * it: given the URL, Airtable fetches it later and silently drops the
+ * attachment when LinkedIn's CDN refuses it. Callers only ever fill blank
+ * attachment cells, which is what an upload (it appends) does.
+ */
+function takeUploads(records) {
+  const uploads = [];
+  const sent = records.map((record, index) => {
+    const fields = { ...(record.fields || {}) };
+    for (const [fieldId, value] of Object.entries(fields)) {
+      if (!linkedinImages(value)) continue;
+      delete fields[fieldId];
+      uploads.push({ index, fieldId, images: value });
+    }
+    return { ...record, fields };
   });
-  return withDetails(data);
+  return { sent, uploads };
+}
+
+function base64(bytes) {
+  let text = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) text += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(text);
+}
+
+/** One image into one record's attachment cell. */
+export function uploadAttachment(token, baseId, recordId, fieldId, { contentType, bytes, filename }) {
+  return airtableRequest(token, `/${encodeURIComponent(baseId)}/${encodeURIComponent(recordId)}/${encodeURIComponent(fieldId)}/uploadAttachment`, {
+    method: "POST",
+    origin: AIRTABLE_CONTENT_API,
+    body: { contentType, file: base64(bytes), filename },
+    // A retry after an unknown outcome could attach it twice; the next sync sees the cell instead.
+    blindRetry: false,
+  });
+}
+
+/**
+ * Upload each record's images once the write has landed. One that doesn't
+ * download or upload is reported as Airtable reports an attachment it couldn't
+ * fetch (a partial success), so the caller tries it again next sync.
+ */
+async function withUploads(token, baseId, data, uploads) {
+  const records = withDetails(data);
+  if (!uploads.length) return records;
+  const urls = [...new Set(uploads.flatMap((upload) => upload.images.map((image) => image.url)))];
+  const downloaded = new Map(await Promise.all(urls.map(async (url) => [url, await fetchImage(url)])));
+  let failed = 0;
+  for (const { index, fieldId, images } of uploads) {
+    const record = records[index];
+    if (!record?.id) continue;
+    for (const image of images) {
+      const file = downloaded.get(image.url);
+      try {
+        if (!file) throw new Error("the image didn't download");
+        const result = await uploadAttachment(token, baseId, record.id, fieldId, { ...file, filename: image.filename || "image.jpg" });
+        record.fields = { ...record.fields, [fieldId]: result?.fields?.[fieldId] || [] };
+      } catch (error) {
+        failed++;
+        LOG(`Couldn't add an image to ${record.id}; trying again next sync:`, error?.message || error);
+        break;
+      }
+    }
+  }
+  if (failed && !attachmentsFailed(records)) {
+    Object.defineProperty(records, "details", {
+      value: { message: "partialSuccess", reasons: ["attachmentsFailedUploading"] },
+      configurable: true,
+    });
+  }
+  return records;
 }
 
 /**

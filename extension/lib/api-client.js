@@ -19,6 +19,8 @@ import {
   readConfig,
   writePeople,
 } from "./airtable-sink.js";
+import { recordMutuals } from "./airtable-mutuals.js";
+import { readMutualPrefs } from "./mutual-prefs.js";
 
 const LOG = (...args) => console.log("[Airtable:Import]", ...args);
 
@@ -218,7 +220,15 @@ async function captureMutualConnections(results) {
     totalBridges: result?.totalBridges || 0,
   }));
   const tally = await writePeople(rows, { source: "Mutual finder" });
-  return { updated: tally.accepted, unresolved: unresolved + tally.failed, mutualPeople: [] };
+  // The people are in; a Mutuals problem is reported, not a failed capture.
+  let mutuals;
+  try {
+    mutuals = await recordMutuals(resolved, { createPeople: (await readMutualPrefs()).createPeople });
+  } catch (error) {
+    LOG("Mutuals rows not written:", error?.message || error);
+    mutuals = { error: error?.message || String(error) };
+  }
+  return { updated: tally.accepted, unresolved: unresolved + tally.failed, mutualPeople: [], mutuals };
 }
 
 async function captureCompanyPeople(payload) {

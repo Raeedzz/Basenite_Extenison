@@ -16,6 +16,7 @@
   "host_permissions": [
     "https://www.linkedin.com/*",
     "https://api.airtable.com/*",
+    "https://content.airtable.com/*",
     "https://*.licdn.com/*"
   ],
   "background": {

@@ -1,5 +1,5 @@
 // Shared setup for the image and edge-case tests: a chrome.storage stub, the real Basanite
-// layout in the strict fake, and stubbed image checker / company details.
+// layout in the strict fake, and stubbed image downloads / company details.
 
 export const store = new Map();
 globalThis.chrome = {
@@ -70,9 +70,9 @@ export function setup(records = {}, { broken = [], tables: tweak = (t) => t, map
     ...config,
   });
   const checked = [];
-  images.setImageChecker(async (url) => {
+  images.setImageFetcher(async (url) => {
     checked.push(url);
-    return !broken.some((part) => url.includes(part));
+    return broken.some((part) => url.includes(part)) ? null : { contentType: "image/jpeg", bytes: new TextEncoder().encode(url) };
   });
   const asked = [];
   state.details = {};

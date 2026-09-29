@@ -18,7 +18,7 @@ Chrome MV3 extension. Captures LinkedIn people straight into an Airtable table a
 
 Network: **Network** is *In network* for your 1st-degree connections and *Outside network* for everyone else (2nd, 3rd, beyond), from the degree LinkedIn reports. A single select, a text column, or a checkbox (checked = in network).
 
-Images: People **Photo**, Companies **Logo**, and Schools **Logo** (attachment columns) get LinkedIn's largest image, named `<slug>.jpg`. Filled only while blank — a photo or logo already there (including one you uploaded) is never replaced, appended to, or cleared. LinkedIn's placeholder avatar and expired links are never sent, and each image is checked before the write; one that won't download is skipped for that record and the rest still lands. The same photo isn't re-sent just because LinkedIn re-signed its URL. Company logos are cached with the company details and looked up again only when a Logo is still blank and the cached link has expired.
+Images: People **Photo**, Companies **Logo**, and Schools **Logo** (attachment columns) get LinkedIn's largest image, named `<slug>.jpg`. Filled only while blank — a photo or logo already there (including one you uploaded) is never replaced, appended to, or cleared. LinkedIn's placeholder avatar and expired links are never sent. The extension downloads each image itself and uploads the bytes (Airtable's `uploadAttachment`, on content.airtable.com) after the record is written: handed a LinkedIn URL, Airtable fetches it later from its own servers and silently drops the attachment when LinkedIn's CDN refuses, which it mostly does. An image that won't download or upload leaves the cell blank for that record, the rest still lands, and it's tried again next sync. The same photo isn't re-sent just because LinkedIn re-signed its URL. Company logos are cached with the company details and looked up again only when a Logo is still blank and the cached link has expired.
 
 Work history: **Current title/company**, **Previous title/company** (latest role they've left), **Past companies** (every company they've left), **Experience** (every role, one line each, no dates) and **Experience timeframes** (the same roles' dates, line for line — "—" where a role has none). **Additional info** is optional (write it only by mapping it): each role's location, company LinkedIn page and description, plus certifications and volunteering. Education: **Education** (every school with degree and field, no dates), **Education timeframes** (the same schools' dates, line for line), **All schools**, **Latest school**.
 
@@ -52,9 +52,11 @@ People extras:
 | Enrich LinkedIn URLs | pasted profile URLs (up to 2,000), same as above |
 | People at a company | current employees (optionally by role keywords), enriched |
 | Search LinkedIn → Add selected | picked search results, enriched |
-| Find mutuals | mutual-connection count + names onto each target's row |
+| Find mutuals | mutual-connection count + names onto each target's row, and one **Mutuals** row per new pair (target, mutual) |
 
 Log interaction needs the base's **Interactions** and **Notes** tables (Basanite OS layout) linked to the People table; the button only shows when they're there. Tables added later are picked up on the next soft sync (or **Reload columns**). It is create-only: it never edits or deletes an interaction or note. Types must already be options on the Types column. If the interaction fails after its note was saved, **Retry** links that same note instead of writing another; a write that timed out is looked up before it is sent again.
+
+Find mutuals reads up to **Max mutuals per profile** (default 50) of a target's mutuals from LinkedIn, then writes pairs into **Mutuals** when the base has it (Basanite OS layout, Person A/B linked to People). It is create-only: one row per undirected pair, Person A = the lower record id, Source = `Branch`, Observed date = the sync date in Chicago. A pair already there either way round is left untouched, and no row is ever edited or deleted. People's own mutual columns are never written; they fill in from the links. A mutual not in People is skipped unless **Create People for mutuals** is on, which adds them (name, LinkedIn, headline, photo) the normal way first. A pair Airtable refuses is skipped and tried again next time. The result reads `Mutuals: X new, Y already linked, Z skipped (not in People)`.
 
 ## How writes work
 
@@ -70,6 +72,7 @@ Log interaction needs the base's **Interactions** and **Notes** tables (Basanite
 - `background/linkedin-capture.js`, `background/linkedin-graph.js` — LinkedIn engines (from EarthOS, unchanged logic)
 - `lib/api-client.js` — the engines' import API, fulfilled locally against Airtable
 - `lib/airtable-sink.js` — config, row index, change detection, write queue
+- `lib/airtable-mutuals.js`, `lib/airtable-interactions.js` — create-only Mutuals / Interactions + Notes writes
 - `lib/airtable-fields.js` — capture fields, auto-mapping, type coercion (pure)
 - `lib/airtable-client.js` — Airtable REST + rate limiting/retries
 - `popup/` — side panel

@@ -919,7 +919,7 @@ const engine = (function () {
     return null;
   }
 
-  async function findBridgesForTarget(csrfToken, publicId, stopped = () => false) {
+  async function findBridgesForTarget(csrfToken, publicId, stopped = () => false, maxBridges = Infinity) {
     // Step 1: Get target's rawMemberId, connection degree, and FULL profile
     // (experience/education/skills/…) — same endpoint the connections-sync
     // enrichment uses, so the out-of-network target lands in the graph
@@ -1013,6 +1013,8 @@ const engine = (function () {
         }
       }
       const added = allBridges.length - before;
+      // Enough for this profile: no more pages, so LinkedIn isn't leaned on.
+      if (allBridges.length >= maxBridges) break;
 
       // All-duplicates page → pagination cursor is stuck. Bail.
       if (added === 0) {
@@ -1038,14 +1040,14 @@ const engine = (function () {
       linkedinUrl: `https://www.linkedin.com/in/${publicId}`,
       connectionDegree,
       profile,
-      bridges: allBridges,
+      bridges: allBridges.slice(0, maxBridges),
       totalBridges,
     };
   }
 
   // ─── Main: Process All Targets ──────────────────────────────────────────────
 
-  async function processTargets(targets, run = _mutualRun) {
+  async function processTargets(targets, run = _mutualRun, maxBridges = Infinity) {
     const stopped = () => _mutualCancel || run !== _mutualRun;
     const progress = (...args) => { if (!stopped()) sendProgress(...args); };
     const fail = (message) => { if (!stopped()) sendError(message); };
@@ -1069,7 +1071,7 @@ const engine = (function () {
       progress(`Checking ${publicId} for mutual connections…`, i, targets.length);
 
       try {
-        const result = await findBridgesForTarget(csrfToken, publicId, stopped);
+        const result = await findBridgesForTarget(csrfToken, publicId, stopped, maxBridges);
         results.push(result);
         progress(
           `${publicId}: ${result.bridges.length} mutual${result.bridges.length === 1 ? "" : "s"}`,
@@ -1094,7 +1096,7 @@ const engine = (function () {
           for (let waited = 0; waited < 30000 && !stopped(); waited += 250) await new Promise((r) => setTimeout(r, 250));
           if (stopped()) return;
           try {
-            const retryResult = await findBridgesForTarget(csrfToken, publicId, stopped);
+            const retryResult = await findBridgesForTarget(csrfToken, publicId, stopped, maxBridges);
             results.push(retryResult);
           } catch (retryErr) {
             ERR(`Retry failed for ${publicId}: ${retryErr.message}`);
@@ -1716,7 +1718,7 @@ const engine = (function () {
     });
   }
 
-  async function findBridges(targets) {
+  async function findBridges(targets, { maxBridges = Infinity } = {}) {
     if (!Array.isArray(targets) || targets.length === 0) return { error: "No targets provided" };
     await primeCsrfToken();
     if (_mutualActive && !_mutualCancel) return { error: "Find mutuals is already running. Let it finish or stop it first." };
@@ -1724,7 +1726,7 @@ const engine = (function () {
     _mutualCancel = false;
     _mutualActive = true;
     const run = ++_mutualRun;
-    trackGraphTask(processTargets(targets, run).catch((err) => {
+    trackGraphTask(processTargets(targets, run, maxBridges).catch((err) => {
       if (!_mutualCancel && run === _mutualRun) sendError(err instanceof Error ? err.message : String(err));
     }).finally(() => {
       if (run === _mutualRun) _mutualActive = false;
@@ -1895,7 +1897,7 @@ const engine = (function () {
   };
 })();
 
-export const findBridges = (targets) => engine.findBridges(targets);
+export const findBridges = (targets, options) => engine.findBridges(targets, options);
 export const fetchCompanyDetails = (companyId) => engine.companyDetails(companyId);
 export const findPeople = (query, limit) => engine.findPeople(query, limit);
 export const enrichProfileUrls = (urls) => engine.enrichProfileUrls(urls);

@@ -56,9 +56,9 @@ test("two entries matching one existing row patch it once, first logo wins", asy
     ],
   };
   await sink.writePeople([row]);
-  const sent = base.writes(COMPANIES).flatMap((entry) => entry.body.records)
-    .filter((record) => record.id === "recCOMPACME000001" && C.logo in record.fields);
-  assert.equal(sent.length, 1, `Logo written ${sent.length} times to one row: ${JSON.stringify(sent.map((r) => r.fields[C.logo][0].url.split("?")[0]))}`);
+  const sent = base.log.filter((entry) => entry.path.endsWith(`/recCOMPACME000001/${C.logo}/uploadAttachment`));
+  assert.equal(sent.length, 1, `Logo uploaded ${sent.length} times to one row`);
+  assert.equal(base.state.get(COMPANIES).records.get("recCOMPACME000001").fields[C.logo][0].source, cdn("logo-one"));
 });
 
 test("the folded name still finds its row after the tables are re-read", async () => {

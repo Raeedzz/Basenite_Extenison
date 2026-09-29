@@ -211,8 +211,8 @@ export function fakeBase({ baseId = BASE_ID, tables }) {
   const log = [];
   // Test hook: the next N creates save their records, then answer 500 — the
   // "did it land?" case that must not turn into duplicates.
-  // partialAttachments: the next N writes land but report their attachments
-  // failed. lockedFields: columns this user can't write (403, like Airtable).
+  // partialAttachments: the next N attachment uploads fail.
+  // lockedFields: columns this user can't write (403, like Airtable).
   const faults = { saveThenFail: 0, nonCollaborators: new Set(), partialAttachments: 0, lockedFields: new Set() };
 
   // Attachments read back the way Airtable returns its own copies.
@@ -252,6 +252,8 @@ export function fakeBase({ baseId = BASE_ID, tables }) {
         const bad = !Array.isArray(value) || value.some((item) => !/^https:\/\//.test(item?.url || "")
           || Object.keys(item).some((key) => key !== "url" && key !== "filename"));
         if (bad) return `${field.name} takes [{url, filename?}]`;
+        // Airtable would fetch these later and drop them; the extension must upload the bytes.
+        if (value.some((item) => /licdn\.com/i.test(new URL(item.url).hostname))) return `${field.name} was sent a LinkedIn URL instead of an upload`;
       }
       if (field.type === "multipleCollaborators") {
         if (!Array.isArray(value) || value.some((user) => !user?.id && !user?.email)) return `${field.name} takes [{id}] or [{email}]`;
@@ -270,6 +272,9 @@ export function fakeBase({ baseId = BASE_ID, tables }) {
     const path = url.pathname;
     log.push({ method, path, body, query: url.search });
     if (method === "DELETE") throw new Error(`DELETE ${path}: the extension must never delete`);
+
+    const upload = path.match(new RegExp(`^/v0/${baseId}/(rec[A-Za-z0-9]+)/([^/]+)/uploadAttachment$`));
+    if (upload && url.hostname === "content.airtable.com" && method === "POST") return uploadAttachment(upload[1], decodeURIComponent(upload[2]), body);
 
     if (path === "/v0/meta/whoami") return json({ id: "usrTEST", email: "ops@example.com", scopes: [] });
     if (path === "/v0/meta/bases") return json({ bases: [{ id: baseId, name: "Test base", permissionLevel: "create" }] });
@@ -302,6 +307,7 @@ export function fakeBase({ baseId = BASE_ID, tables }) {
       const created = body.records.map((record) => {
         const id = newId();
         table.records.set(id, { id, fields: stored(table, record.fields) });
+        linkBack(table, id, record.fields);
         return { id, fields: record.fields };
       });
       if (faults.saveThenFail > 0) {
@@ -324,6 +330,40 @@ export function fakeBase({ baseId = BASE_ID, tables }) {
       });
     }
     return json({ error: "METHOD_NOT_ALLOWED" }, 405);
+  }
+
+  /**
+   * content.airtable.com's uploadAttachment: base64 bytes appended to one cell.
+   * Test images are their own URL as bytes, so `source` says which one landed.
+   */
+  function uploadAttachment(recordId, fieldRef, body) {
+    const table = [...state.values()].find((candidate) => candidate.records.has(recordId));
+    if (!table) return json({ error: { type: "ROW_DOES_NOT_EXIST", message: "Record not found" } }, 404);
+    const field = table.fields.find((candidate) => candidate.id === fieldRef || candidate.name === fieldRef);
+    if (field?.type !== "multipleAttachments") return json({ error: { type: "INVALID_FIELD_TYPE", message: `${fieldRef} isn't an attachment field` } }, 422);
+    if (!body?.file || !body.contentType || !body.filename) return json({ error: { type: "INVALID_REQUEST", message: "contentType, file and filename are required" } }, 422);
+    if (faults.partialAttachments > 0) {
+      faults.partialAttachments--;
+      return json({ error: { type: "INVALID_ATTACHMENT", message: "Couldn't process the attachment" } }, 422);
+    }
+    const row = table.records.get(recordId);
+    const attachment = { id: `att${++nextAttachment}`, url: `https://v5.airtableusercontent.com/${nextAttachment}`,
+      filename: body.filename, type: body.contentType, source: Buffer.from(body.file, "base64").toString() };
+    row.fields[field.id] = [...(row.fields[field.id] || []), attachment];
+    return json({ id: recordId, createdTime: new Date().toISOString(), fields: { [field.id]: row.fields[field.id] } });
+  }
+
+  /** Like Airtable: a created link shows up in the linked record's inverse column. */
+  function linkBack(table, id, fields) {
+    for (const [fieldId, value] of Object.entries(fields || {})) {
+      const inverse = table.fields.find((field) => field.id === fieldId)?.options?.inverseLinkFieldId;
+      if (!inverse) continue;
+      const target = state.get(table.fields.find((field) => field.id === fieldId).options.linkedTableId);
+      for (const linked of value) {
+        const row = target.records.get(linked);
+        row.fields[inverse] = [...(row.fields[inverse] || []), id];
+      }
+    }
   }
 
   /** Airtable's 200-with-details when attachments didn't make it: the cells stay empty. */

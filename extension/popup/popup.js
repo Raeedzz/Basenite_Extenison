@@ -9,6 +9,7 @@ import {
   stageMessage,
   syncHistoryDetail,
 } from "../lib/progress-copy.js";
+import { MUTUAL_PREFS_KEY, normalizeMutualPrefs, readMutualPrefs } from "../lib/mutual-prefs.js";
 import { normalizeSoftSyncPrefs } from "../lib/soft-sync-prefs.js";
 
 const LOG = (...args) => console.log("[Panel]", ...args);
@@ -1194,6 +1195,21 @@ $("search-add-btn").addEventListener("click", () => {
 });
 $("search-mutuals-btn").addEventListener("click", () => startMutuals(selectedSearchUrls()));
 
+async function renderMutualPrefs() {
+  const prefs = await readMutualPrefs().catch(() => normalizeMutualPrefs(null));
+  $("mutuals-max").value = String(prefs.maxPerProfile);
+  $("mutuals-create").checked = prefs.createPeople;
+}
+
+async function saveMutualPrefs() {
+  const prefs = normalizeMutualPrefs({ maxPerProfile: Number($("mutuals-max").value), createPeople: $("mutuals-create").checked });
+  await chrome.storage.local.set({ [MUTUAL_PREFS_KEY]: prefs }).catch(() => {});
+  $("mutuals-max").value = String(prefs.maxPerProfile);
+}
+
+$("mutuals-max").addEventListener("change", saveMutualPrefs);
+$("mutuals-create").addEventListener("change", saveMutualPrefs);
+
 // ─── Auto-sync ───────────────────────────────────────────────────────────────
 
 function renderSoftSync() {
@@ -1401,6 +1417,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const stored = await chrome.storage.local.get(THEME_KEY);
   applyTheme(stored[THEME_KEY] || document.documentElement.dataset.theme);
   await readSyncHistory();
+  await renderMutualPrefs();
   await refreshConfig();
   renderView();
   await readActiveProfile();
