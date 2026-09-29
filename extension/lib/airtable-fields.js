@@ -111,7 +111,8 @@ export const SOURCE_FIELD_BY_KEY = new Map(SOURCE_FIELDS.map((field) => [field.k
 /** The `/in/<slug>` of a LinkedIn URL, lowercased; null for anything else. */
 export function linkedinKey(value) {
   if (typeof value !== "string" || !value) return null;
-  const match = value.match(/linkedin\.com\/in\/([^/?#\s]+)/i);
+  // Brackets and quotes end the slug: a link pasted into notes as <…>, (…) or "…".
+  const match = value.match(/linkedin\.com\/in\/([^/?#\s<>()[\]"'`]+)/i);
   if (!match) return null;
   let slug = match[1];
   try { slug = decodeURIComponent(slug); } catch {}
@@ -515,12 +516,10 @@ export function cellValue(value, field) {
 // ─── Auto-mapping ────────────────────────────────────────────────────────────
 
 export function normalizeName(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/[_\-./]+/g, " ")
-    .replace(/[^a-z0-9# ]+/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  const spaced = String(value || "").toLowerCase().replace(/[_\-./]+/g, " ");
+  const latin = spaced.replace(/[^a-z0-9# ]+/g, "").replace(/\s+/g, " ").trim();
+  // A name with no Latin letters (حكومي, 京都…) keeps its own, or it would never match itself.
+  return latin || spaced.normalize("NFKC").replace(/[^\p{L}\p{N}# ]+/gu, "").replace(/\s+/g, " ").trim();
 }
 
 /**

@@ -2,12 +2,19 @@
 // pauses with an error, the user fixes it and presses Resume. Does every pasted person land?
 import { boot, makeBase, fakeLinkedIn, setupAirtable, report, until, sleep, L, F, urlFor } from "./lib.mjs";
 
-let blocked = false;
+// LinkedIn starts soft-blocking right after the first batch's ten people, whatever the pipeline has read ahead.
+let blocked = null;
+const seen = new Set();
 const at = makeBase();
 const li = fakeLinkedIn({
   connections: 0,
-  hook: (url, u) => (blocked && u.pathname === "/voyager/api/identity/dash/profiles"
-    ? new Response(JSON.stringify({ elements: [] }), { status: 200, headers: { "content-type": "application/json" } }) : undefined),
+  hook: (url, u) => {
+    if (u.pathname !== "/voyager/api/identity/dash/profiles") return undefined;
+    const id = u.searchParams.get("memberIdentity");
+    if (blocked === null && !seen.has(id) && seen.size >= 10) blocked = true;
+    seen.add(id);
+    return blocked ? new Response(JSON.stringify({ elements: [] }), { status: 200, headers: { "content-type": "application/json" } }) : undefined;
+  },
 });
 const out = [];
 const w = await boot({ airtable: at, linkedin: li });
@@ -16,8 +23,6 @@ try {
   await setupAirtable(w);
   const urls = Array.from({ length: 40 }, (_, i) => urlFor(i)).join("\n");
   await w.send({ type: "BULK_ENRICH", urls });
-  await until(() => job()?.next >= 10, "first batch");
-  blocked = true; // LinkedIn starts soft-blocking
   const paused = await until(() => (["error", "complete"].includes(job()?.status) ? job() : null), "pause", 120_000);
   out.push(`paused: status=${paused.status} next=${paused.next} failed=${paused.failed} failedUrls=${paused.failedUrls.length} error="${paused.error}"`);
   out.push(`enrich_progress: ${JSON.stringify(w.store.get("enrich_progress"))}`);

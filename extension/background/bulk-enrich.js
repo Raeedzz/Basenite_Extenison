@@ -9,6 +9,7 @@
  */
 
 import { captureProfiles } from "../lib/api-client.js";
+import { prefetchLinkedDetails } from "../lib/airtable-sink.js";
 import { canonicalLinkedinUrl } from "../lib/airtable-fields.js";
 import { setEnrichProgress } from "./capture-state.js";
 import { enrichProfileUrls } from "./linkedin-graph.js";
@@ -21,7 +22,7 @@ export const BULK_MAX_URLS = 2_000;
 export const TABLE_MAX_URLS = 10_000;
 const BATCH_SIZE = 10;
 // Between batches, on top of the enricher's own pacing inside a batch.
-const BATCH_PAUSE_MS = [2_000, 4_000];
+const BATCH_PAUSE_MS = [500, 1_500];
 // A signed-out or blocked session fails every profile without an error of its
 // own. Two whole batches with nothing back is that, not bad luck.
 const EMPTY_BATCHES_BEFORE_PAUSE = 2;
@@ -159,6 +160,35 @@ async function runJob() {
   if (running) return;
   running = true;
   let job = await readBulkJob();
+  // While one batch writes to Airtable, the next is read from LinkedIn: its
+  // profiles, then the companies its write would ask about. LinkedIn still
+  // sees one paced stream; only the Airtable time is overlapped.
+  let cursor = job?.next ?? 0;
+  let emptyBatches = job?.emptyBatches ?? 0;
+  let emptyFrom = job?.emptyFrom ?? null;
+  let writing = null;
+  const land = async () => {
+    if (!writing) return;
+    const batch = writing;
+    writing = null;
+    const tally = batch.profiles.length ? await batch.write : null;
+    job = {
+      ...job,
+      emptyFrom: batch.emptyFrom,
+      next: batch.end,
+      created: job.created + (tally?.created || 0),
+      updated: job.updated + (tally?.updated || 0),
+      unchanged: job.unchanged + (tally?.unchanged || 0),
+      failed: job.failed + batch.failedUrls.length + (tally?.failed || 0),
+      failedUrls: [...job.failedUrls, ...batch.failedUrls].slice(-500),
+      emptyBatches: batch.emptyBatches,
+      lastName: batch.profiles.at(-1)?.name || job.lastName || null,
+    };
+    // Stopped meanwhile: the caller stores it as canceled; saving it as running could resume it.
+    if (await stopped()) return;
+    await saveJob(job);
+    await publish(job);
+  };
   try {
     await publish(job);
     const cancel = async () => {
@@ -166,17 +196,23 @@ async function runJob() {
       await saveJob(job);
       await setEnrichProgress({ status: "canceled" });
     };
-    while (job.next < job.urls.length) {
-      if (await stopped()) return cancel();
-      const batch = job.urls.slice(job.next, job.next + BATCH_SIZE);
+    // Stopped: what was already sent to Airtable is kept, and the job stays stopped.
+    const landThenCancel = async () => {
+      await land().catch(() => {});
+      return cancel();
+    };
+    while (cursor < job.urls.length) {
+      if (await stopped()) return landThenCancel();
+      const batch = job.urls.slice(cursor, cursor + BATCH_SIZE);
       const enriched = await enrichProfileUrls(batch);
       const profiles = Array.isArray(enriched?.profiles) ? enriched.profiles : [];
       const failedUrls = Array.isArray(enriched?.failedUrls) ? enriched.failedUrls : [];
-      const emptyBatches = profiles.length === 0 ? job.emptyBatches + 1 : 0;
+      emptyBatches = profiles.length === 0 ? emptyBatches + 1 : 0;
       if (emptyBatches >= EMPTY_BATCHES_BEFORE_PAUSE) {
+        await land();
         // Every empty batch in the run was the session, not those people:
         // rewind to the first of them so resuming retries all of it.
-        const from = job.emptyFrom ?? job.next;
+        const from = emptyFrom ?? job.next;
         const rewound = job.urls.slice(from, job.next);
         job = {
           ...job,
@@ -192,27 +228,23 @@ async function runJob() {
         await setEnrichProgress({ status: "error", message: job.error, bulk: true });
         return;
       }
-      const tally = profiles.length ? await captureProfiles(profiles, { source: job.source || "Bulk enrich" }) : null;
-      job = {
-        ...job,
-        emptyFrom: profiles.length ? null : job.emptyFrom ?? job.next,
-        next: job.next + batch.length,
-        created: job.created + (tally?.created || 0),
-        updated: job.updated + (tally?.updated || 0),
-        unchanged: job.unchanged + (tally?.unchanged || 0),
-        failed: job.failed + failedUrls.length + (tally?.failed || 0),
-        failedUrls: [...job.failedUrls, ...failedUrls].slice(-500),
-        emptyBatches,
-        lastName: profiles.at(-1)?.name || job.lastName || null,
-      };
-      // Stopped while that batch was in flight: what it wrote is kept, and the job stays stopped.
+      emptyFrom = profiles.length ? null : emptyFrom ?? cursor;
+      if (profiles.length) await prefetchLinkedDetails(profiles).catch(() => {});
+      const fetchedAt = Date.now();
+      await land();
       if (await stopped()) return cancel();
-      await saveJob(job);
-      await publish(job);
-      if (job.next < job.urls.length) {
-        await pause(BATCH_PAUSE_MS[0] + Math.random() * (BATCH_PAUSE_MS[1] - BATCH_PAUSE_MS[0]));
+      const write = profiles.length ? captureProfiles(profiles, { source: job.source || "Bulk enrich" }) : null;
+      // Awaited in land(); until then a failure mustn't read as unhandled.
+      write?.catch(() => {});
+      writing = { end: cursor + batch.length, profiles, failedUrls, emptyBatches, emptyFrom, write };
+      cursor += batch.length;
+      if (cursor < job.urls.length) {
+        // Time spent writing to Airtable counts toward LinkedIn's rest.
+        await pause(BATCH_PAUSE_MS[0] + Math.random() * (BATCH_PAUSE_MS[1] - BATCH_PAUSE_MS[0]) - (Date.now() - fetchedAt));
       }
     }
+    await land();
+    if (await stopped()) return cancel();
     job = { ...job, status: "complete", completedAt: Date.now() };
     await saveJob(done(job));
     await setEnrichProgress({
@@ -224,6 +256,8 @@ async function runJob() {
     });
     LOG(`Done: ${summary(job)}`);
   } catch (error) {
+    // A write still in flight lands first, so the counts and the resume point include it.
+    if (writing) await land().catch(() => {});
     const message = error?.message || String(error);
     LOG("Stopped:", message);
     if (cancelRequested && job?.urls) {

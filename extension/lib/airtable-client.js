@@ -24,6 +24,7 @@ const RATE_LIMIT_WAIT_MS = 30_000;
 const TIMEOUT_MS = 30_000;
 const MAX_SERVER_ATTEMPTS = 5;
 const MAX_NETWORK_ATTEMPTS = 10;
+const UPLOAD_CONCURRENCY = 5;
 
 export class AirtableError extends Error {
   constructor(message, { status = 0, type = null, retryAfterMs = null, cause } = {}) {
@@ -317,22 +318,28 @@ async function withUploads(token, baseId, data, uploads) {
   const urls = [...new Set(uploads.flatMap((upload) => upload.images.map((image) => image.url)))];
   const downloaded = new Map(await Promise.all(urls.map(async (url) => [url, await fetchImage(url)])));
   let failed = 0;
-  for (const { index, fieldId, images } of uploads) {
-    const record = records[index];
-    if (!record?.id) continue;
-    for (const image of images) {
-      const file = downloaded.get(image.url);
-      try {
-        if (!file) throw new Error("the image didn't download");
-        const result = await uploadAttachment(token, baseId, record.id, fieldId, { ...file, filename: image.filename || "image.jpg" });
-        record.fields = { ...record.fields, [fieldId]: result?.fields?.[fieldId] || [] };
-      } catch (error) {
-        failed++;
-        LOG(`Couldn't add an image to ${record.id}; trying again next sync:`, error?.message || error);
-        break;
+  // Cells upload side by side (takeSlot still paces them); a cell's own images go in order.
+  const queue = [...uploads];
+  const worker = async () => {
+    for (let upload = queue.shift(); upload; upload = queue.shift()) {
+      const { index, fieldId, images } = upload;
+      const record = records[index];
+      if (!record?.id) continue;
+      for (const image of images) {
+        const file = downloaded.get(image.url);
+        try {
+          if (!file) throw new Error("the image didn't download");
+          const result = await uploadAttachment(token, baseId, record.id, fieldId, { ...file, filename: image.filename || "image.jpg" });
+          record.fields = { ...record.fields, [fieldId]: result?.fields?.[fieldId] || [] };
+        } catch (error) {
+          failed++;
+          LOG(`Couldn't add an image to ${record.id}; trying again next sync:`, error?.message || error);
+          break;
+        }
       }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, uploads.length) }, worker));
   if (failed && !attachmentsFailed(records)) {
     Object.defineProperty(records, "details", {
       value: { message: "partialSuccess", reasons: ["attachmentsFailedUploading"] },

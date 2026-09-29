@@ -238,3 +238,13 @@ test("worker: create People on, cap 5: five new People, five pairs", async () =>
   assert.equal(base.rows(M.table).length, 5);
   assert.ok(base.rows(M.table).every((record) => record.fields[M.personA][0] < record.fields[M.personB][0]));
 });
+
+test("two mutual saves at the same moment that meet the same pair make one row", async () => {
+  const { base } = ready();
+  const [first, second] = await Promise.all([
+    recordMutuals([result([bridge("ann")])], { now: NOW }),
+    recordMutuals([result([bridge("mia")], { slug: "ann", name: "Ann Early" })], { now: NOW }),
+  ]);
+  assert.equal(first.created + second.created, 1);
+  assert.equal(base.rows(M.table).length, 1);
+});

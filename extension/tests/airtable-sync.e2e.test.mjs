@@ -665,3 +665,115 @@ test("a test sync after a real one doesn't switch the schedule off", async () =>
     restore();
   }
 });
+
+// Airtable that holds (or refuses) the People creates, for racing a bulk enrich's two stages.
+function gatedAirtable(airtable, onCreate) {
+  return {
+    ...airtable,
+    handle: async (input, init = {}) => {
+      const creating = init.method === "POST" && !String(input).includes("listRecords");
+      if (!creating) return airtable.handle(input, init);
+      return onCreate(() => airtable.handle(input, init));
+    },
+  };
+}
+
+async function bulkWorker(airtable, urls, onProfile = () => {}, { settle = true } = {}) {
+  (await import("../lib/airtable-sink.js")).forgetTableState();
+  const { linkedin, fetchImpl } = network(airtable);
+  const worker = await bootWorker({
+    fetch: (input, init) => {
+      const id = new URL(String(input), "https://www.linkedin.com").searchParams.get("memberIdentity");
+      if (id) onProfile(id);
+      return fetchImpl(input, init);
+    },
+    cookies: signedInToLinkedIn,
+    storage: { airtable_config: (await import("./helpers/fake-airtable.mjs")).airtableConfig() },
+  });
+  const started = await worker.send({ type: "BULK_ENRICH", urls: urls.join("\n") });
+  assert.equal(started.error, undefined, started.error);
+  if (!settle) return { ...worker, linkedin };
+  const settled = await until(() => {
+    const job = worker.store.get("bulk_enrich_job");
+    return job?.status === "complete" || job?.status === "error" ? job : null;
+  }, "the bulk enrich to settle", 90_000);
+  return { ...worker, linkedin, settled };
+}
+
+test("while one batch writes to Airtable, the next is already read from LinkedIn", async () => {
+  const airtable = fakeAirtable();
+  const events = [];
+  const slow = gatedAirtable(airtable, async (send) => {
+    events.push("write-start");
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    const response = await send();
+    events.push("write-end");
+    return response;
+  });
+  const urls = Array.from({ length: 20 }, (_, index) => `https://www.linkedin.com/in/ada-number-${index}`);
+  const { send, restore, settled } = await bulkWorker(slow, urls, (id) => events.push(`read:${id}`));
+  try {
+    assert.equal(settled.status, "complete", settled.error);
+    assert.equal(settled.created, 20);
+    assert.equal(airtable.table.records.size, 20);
+    const secondBatch = events.findIndex((event) => /^read:ada-number-1\d$/.test(event));
+    assert.ok(secondBatch > 0 && secondBatch < events.indexOf("write-end"), `LinkedIn waited for Airtable: ${events.join(" ")}`);
+  } finally {
+    await send({ type: "CANCEL_SYNC" }).catch(() => {});
+    restore();
+  }
+});
+
+test("a batch whose write fails is where the job resumes, even with the next one already read", async () => {
+  const airtable = fakeAirtable();
+  let creates = 0;
+  const failing = gatedAirtable(airtable, async (send) => {
+    if (++creates < 2) return send();
+    // Held long enough for the next batch to be read from LinkedIn first.
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    return json({ error: { type: "AUTHENTICATION_REQUIRED", message: "Authentication required" } }, 401);
+  });
+  const urls = Array.from({ length: 25 }, (_, index) => `https://www.linkedin.com/in/ada-number-${index}`);
+  const read = new Set();
+  const { send, restore, settled } = await bulkWorker(failing, urls, (id) => read.add(id));
+  try {
+    assert.equal(settled.status, "error");
+    assert.equal(settled.next, 10, "the resume point moved past a batch that never landed");
+    assert.equal(settled.created, 10);
+    assert.equal(airtable.table.records.size, 10);
+    assert.ok(read.has("ada-number-20"), "the third batch wasn't read while the second wrote");
+  } finally {
+    await send({ type: "CANCEL_SYNC" }).catch(() => {});
+    restore();
+  }
+});
+
+test("Stop pressed while a batch writes: that batch lands, and the job is never stored as running again", async () => {
+  const airtable = fakeAirtable();
+  let writing = false;
+  let landed = false;
+  const held = gatedAirtable(airtable, async (send) => {
+    writing = true;
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    const response = await send();
+    landed = true;
+    return response;
+  });
+  const urls = Array.from({ length: 25 }, (_, index) => `https://www.linkedin.com/in/ada-number-${index}`);
+  const { send, restore, store, writes } = await bulkWorker(held, urls, () => {}, { settle: false });
+  try {
+    await until(() => writing, "the first write to start");
+    await send({ type: "CANCEL_SYNC" });
+    await until(() => landed && store.get("enrich_progress")?.status === "canceled", "the stop to settle", 30_000);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const history = writes.get("bulk_enrich_job").map((job) => job.status);
+    const stoppedAt = history.indexOf("canceled");
+    assert.ok(stoppedAt >= 0);
+    assert.deepEqual(history.slice(stoppedAt).filter((status) => status !== "canceled"), [], `stored after Stop: ${history.join(" ")}`);
+    assert.equal(store.get("bulk_enrich_job").urls.length, 0, "a stopped job kept its list, so it could resume");
+    assert.equal(airtable.table.records.size, 10, "the batch sent before Stop didn't land");
+  } finally {
+    await send({ type: "CANCEL_SYNC" }).catch(() => {});
+    restore();
+  }
+});

@@ -864,19 +864,20 @@ const engine = (function () {
     // read across the whole response rather than off whichever item happens
     // to carry the name.
     const connectionDegree = readProfileDegree(data);
-    for (const item of combined) {
-      const urnMatch = (item.entityUrn || "").match(/fsd_profile:([^,)]+)/);
-      if (!urnMatch) continue;
-      if (item.publicIdentifier !== publicId && !item.firstName) continue;
-      return {
-        rawId: urnMatch[1],
-        connectionDegree,
-        firstName: item.firstName || "",
-        lastName: item.lastName || "",
-        headline: item.headline || null,
-      };
-    }
-    return null;
+    const profiles = combined.filter((item) => /fsd_profile:/.test(item.entityUrn || ""));
+    const slug = (value) => String(value || "").toLowerCase();
+    // An old or differently-cased URL answers with the profile under its current one.
+    const item = profiles.find((candidate) => slug(candidate.publicIdentifier) === slug(publicId))
+      || profiles.find((candidate) => candidate.firstName);
+    if (!item) return null;
+    return {
+      rawId: item.entityUrn.match(/fsd_profile:([^,)]+)/)[1],
+      publicIdentifier: item.publicIdentifier || null,
+      connectionDegree,
+      firstName: item.firstName || "",
+      lastName: item.lastName || "",
+      headline: item.headline || null,
+    };
   }
 
   /**
@@ -1173,6 +1174,8 @@ const engine = (function () {
    * rest. A batch-wide 429 pauses the whole pool and retries once.
    */
   const ENRICH_PARALLEL = 5;
+  // Measured live against LinkedIn at this pace (with the company spacing below): no throttling.
+  const ENRICH_CHUNK_DELAY_MS = [300, 600];
 
   async function enrichOne(publicId, csrfToken) {
     const data = await fetchFullProfile(publicId, csrfToken);
@@ -1184,7 +1187,9 @@ const engine = (function () {
     const connectionDegree = identity.connectionDegree
       ?? await fetchProfileDegree(publicId, csrfToken);
     return {
-      linkedinUrl: `https://www.linkedin.com/in/${publicId}`,
+      // Their current URL and member id, so an old link to them finds their row instead of making one.
+      linkedinUrl: `https://www.linkedin.com/in/${identity.publicIdentifier || publicId}`,
+      memberId: identity.rawId,
       name,
       connectionDegree,
       headline: identity.headline,
@@ -1261,10 +1266,9 @@ const engine = (function () {
         }
       }
 
-      // Stealth delay between chunks — mirrors the connections-sync
-      // enrichment pass (800–1500ms normal distribution).
+      // Stealth delay between chunks.
       if (i + ENRICH_PARALLEL < urls.length) {
-        await humanDelay(PAGE_DELAY_MS[0], PAGE_DELAY_MS[1]);
+        await humanDelay(ENRICH_CHUNK_DELAY_MS[0], ENRICH_CHUNK_DELAY_MS[1]);
       }
     }
 
@@ -1765,7 +1769,7 @@ const engine = (function () {
   // the answer), and spaced out so a first sync over a large network doesn't
   // turn into a burst of company lookups.
 
-  const COMPANY_DETAIL_SPACING_MS = [350, 700];
+  const COMPANY_DETAIL_SPACING_MS = [150, 300];
   let lastCompanyDetailAt = 0;
 
   function companyEntityFrom(data, companyId) {
@@ -1806,9 +1810,10 @@ const engine = (function () {
 
   async function companyDetails(companyId) {
     if (!/^\d+$/.test(String(companyId || ""))) return null;
-    const wait = lastCompanyDetailAt + humanDelayMs() - Date.now();
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
-    lastCompanyDetailAt = Date.now();
+    // Reserved before waiting, so two callers at once still go one spacing apart.
+    const slot = Math.max(Date.now(), lastCompanyDetailAt + humanDelayMs());
+    lastCompanyDetailAt = slot;
+    if (slot > Date.now()) await new Promise((resolve) => setTimeout(resolve, slot - Date.now()));
     const csrfToken = cachedCsrfToken || await primeCsrfToken();
     const urls = [
       `/voyager/api/organization/companies/${companyId}?decorationId=com.linkedin.voyager.deco.organization.web.WebFullCompanyMain-12`,

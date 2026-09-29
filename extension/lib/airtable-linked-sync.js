@@ -22,6 +22,7 @@ import {
 } from "./airtable-client.js";
 import { attachmentFor, cellValue, fingerprint, imageExpired, imageUrl, normalizeName } from "./airtable-fields.js";
 import {
+  extractLinked,
   linkedinPath,
   linkedinUrlFor,
   linkedReady,
@@ -35,6 +36,7 @@ const INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const DETAILS_KEY = "linkedin_company_details";
 // A company LinkedIn wouldn't describe is asked about again after this long.
 const DETAILS_RETRY_MS = 7 * 24 * 60 * 60 * 1000;
+const PREFETCH_CONCURRENCY = 3;
 const DETAIL_KEYS = new Set(["about", "website", "industry", "linkedinUrl"]);
 
 // ─── Company details from LinkedIn ───────────────────────────────────────────
@@ -82,7 +84,17 @@ const DETAILS_PAUSE_MS = 10 * 60 * 1000;
 let detailsPausedUntil = 0;
 const detailsPaused = () => Date.now() < detailsPausedUntil;
 
-async function fetchDetails(companyId, progress = null) {
+// A company already being asked about (by a prefetch and a write at once): one request.
+const detailsInFlight = new Map();
+
+function fetchDetails(companyId, progress = null) {
+  if (!detailsInFlight.has(companyId)) {
+    detailsInFlight.set(companyId, askDetails(companyId, progress).finally(() => detailsInFlight.delete(companyId)));
+  }
+  return detailsInFlight.get(companyId);
+}
+
+async function askDetails(companyId, progress) {
   const cache = await loadDetails();
   // Paused: the company rows are still written, and their blank details are
   // filled on a later sync. A company lookup never fails the Airtable write.
@@ -114,9 +126,14 @@ async function fetchDetails(companyId, progress = null) {
 
 let stores = null;
 
+function storesId(config) {
+  const linked = config.linked || {};
+  return [config.baseId, linked.companies?.tableId, linked.schools?.tableId, linked.workHistory?.tableId].join(":");
+}
+
 function storesFor(config) {
   const linked = config.linked || {};
-  const id = [config.baseId, linked.companies?.tableId, linked.schools?.tableId, linked.workHistory?.tableId].join(":");
+  const id = storesId(config);
   if (stores?.id === id) return stores;
   const prefix = (tableId) => `airtable_linked:${config.baseId}:${tableId}`;
   stores = {
@@ -439,6 +456,64 @@ function sharedValues(kind, entity, details) {
   };
 }
 
+/** The row an entity is, by LinkedIn page and then by name; else null. */
+function matchShared(kind, store, lookups, entity, details) {
+  const paths = [
+    details?.universalName ? `company/${String(details.universalName).toLowerCase()}` : null,
+    entity.linkedinPath,
+  ].filter(Boolean);
+  for (const path of paths) {
+    const hit = lookups.byPath.get(path);
+    if (hit) return hit;
+  }
+  for (const name of [entity.name, details?.name]) {
+    const candidates = lookups.byName.get(normalizeName(name)) || [];
+    // A company row that already names a LinkedIn page is someone else's
+    // unless the page matched above, or the extension folded this typed-in
+    // name into it itself (x); schools match on name alone.
+    // A typed-in name with no page of its own joins the only row by that name.
+    const hit = kind === "schools" ? candidates[0]
+      : candidates.find((id) => !store.get(id)?.p) || candidates.find((id) => store.get(id)?.x)
+        || (paths.length === 0 && candidates.length === 1 ? candidates[0] : null);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * Ask LinkedIn now about the companies a write of these profiles would ask
+ * about, so a bulk enrich does it while the previous batch writes to Airtable.
+ * Reads the index only as it stands (no Airtable calls); anything missed here
+ * is asked by the write itself, as before.
+ */
+export async function prefetchCompanyDetails(config, rows) {
+  if (!detailsProvider || !linkedReady(config?.linked).companies) return;
+  // Only an index a write already loaded: never swapped or read from Airtable under one.
+  const store = stores?.id === storesId(config) ? stores.companies : null;
+  if (!store?.indexedAt) return;
+  const part = config.linked.companies;
+  const lookups = lookupsFor("companies", store);
+  const wanted = new Map();
+  for (const row of rows) {
+    for (const entity of extractLinked(row).companies.values()) {
+      if (!entity.companyId || wanted.has(entity.companyId) || (await cachedDetails(entity.companyId)) !== undefined) continue;
+      const recordId = matchShared("companies", store, lookups, entity, undefined);
+      const filled = recordId ? store.get(recordId)?.e || {} : null;
+      if (filled && !Object.keys(part.fields).some((key) => DETAIL_KEYS.has(key) && !filled[key])) continue;
+      wanted.set(entity.companyId, entity);
+    }
+  }
+  // A few at once; the provider still spaces when each one starts.
+  const queue = [...wanted.values()];
+  let done = 0;
+  const worker = async () => {
+    for (let entity = queue.shift(); entity && !detailsPaused(); entity = queue.shift()) {
+      await fetchDetails(entity.companyId, { done: ++done, total: wanted.size, name: entity.name });
+    }
+  };
+  await Promise.all(Array.from({ length: PREFETCH_CONCURRENCY }, worker));
+}
+
 /**
  * Find or create each company (or school), filling blanks on rows that exist.
  * Returns entity key → record id.
@@ -456,26 +531,7 @@ async function resolveShared(config, kind, entities, tally) {
   const creates = [];
   const patches = [];
 
-  const match = (entity, details) => {
-    const paths = [
-      details?.universalName ? `company/${String(details.universalName).toLowerCase()}` : null,
-      entity.linkedinPath,
-    ].filter(Boolean);
-    for (const path of paths) {
-      const hit = lookups.byPath.get(path);
-      if (hit) return hit;
-    }
-    for (const name of [entity.name, details?.name]) {
-      const candidates = lookups.byName.get(normalizeName(name)) || [];
-      // A company row that already names a LinkedIn page is someone else's
-      // unless the page matched above, or the extension folded this typed-in
-      // name into it itself (x); schools match on name alone.
-      const hit = kind === "schools" ? candidates[0]
-        : candidates.find((id) => !store.get(id)?.p) || candidates.find((id) => store.get(id)?.x);
-      if (hit) return hit;
-    }
-    return null;
-  };
+  const match = (entity, details) => matchShared(kind, store, lookups, entity, details);
 
   // Only companies LinkedIn is asked about count toward "looking up N".
   const toLookUp = kind === "companies"
@@ -520,7 +576,8 @@ async function resolveShared(config, kind, entities, tally) {
     // sync rather than risk a second row.
     if (kind === "companies" && entity.companyId && neverAsked && !details && detailsPaused()) continue;
     const values = sharedValues(kind, entity, details);
-    if (!values.name) continue;
+    // "--" and the like aren't a company or school.
+    if (!normalizeName(values.name)) continue;
     // Already being created for someone else in this batch (the same company
     // reached once by its LinkedIn id and once by name): one row, both keys.
     const path = linkedinPath(values.linkedinUrl);

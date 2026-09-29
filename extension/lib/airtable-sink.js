@@ -49,6 +49,7 @@ import {
   forgetLinkedState,
   markLinkedStale,
   persistLinked,
+  prefetchCompanyDetails,
   prepareLinked,
   resetLinkedState,
   resolvePeopleLinks,
@@ -817,6 +818,12 @@ async function reconcileUpdates(config, items) {
     }
   }
   return items;
+}
+
+/** Ask LinkedIn about these profiles' companies ahead of their write (see prefetchCompanyDetails). */
+export async function prefetchLinkedDetails(rows) {
+  const config = await readConfig();
+  if (!configProblem(config)) await prefetchCompanyDetails(config, Array.isArray(rows) ? rows : []);
 }
 
 /**

@@ -44,6 +44,10 @@ export function observedDate(now = new Date()) {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Chicago", year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
 }
 
+// One sync at a time: each reads the pairs the one before it created, so two
+// saves that meet the same pair can't both create it.
+let syncQueue = Promise.resolve();
+
 const pairKey = (x, y) => (x < y ? `${x}|${y}` : `${y}|${x}`);
 const only = (value) => (Array.isArray(value) && value.length === 1 ? value[0] : null);
 
@@ -113,7 +117,13 @@ async function sendCreates(config, items, tally, pairs) {
  * `targets`: [{ id, name, mutuals: [{ id | null, name }] }], ids being People
  * record ids (null: not in People). Returns { created, existing, skipped, failed }.
  */
-export async function syncMutuals(config, targets, now = new Date()) {
+export function syncMutuals(config, targets, now = new Date()) {
+  const task = syncQueue.then(() => syncTargets(config, targets, now));
+  syncQueue = task.catch(() => {});
+  return task;
+}
+
+async function syncTargets(config, targets, now) {
   const tally = { created: 0, existing: 0, skipped: 0, failed: 0 };
   const named = targets.filter((target) => target.id);
   for (const target of targets) {
