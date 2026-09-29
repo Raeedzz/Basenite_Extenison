@@ -48,6 +48,8 @@ People extras:
 | Quick refresh / automatic soft sync | re-walks connections; only people not yet in the table get the profile pass |
 | This profile → Add to Airtable | the LinkedIn profile open in the active tab |
 | This profile → Log interaction | one **Interactions** row (types, when, person) and, if a note was typed, one **Notes** row it links; adds the person to People first if they aren't there |
+| Enrich a table | every LinkedIn URL in a column of any table in the base (e.g. *Dex Contacts* → *LinkedIn*), full profile into People like a sync; up to 10,000, deduped, resumable, Source = `Table: <name>` on new rows |
+| Enrich LinkedIn URLs | pasted profile URLs (up to 2,000), same as above |
 | People at a company | current employees (optionally by role keywords), enriched |
 | Search LinkedIn → Add selected | picked search results, enriched |
 | Find mutuals | mutual-connection count + names onto each target's row |

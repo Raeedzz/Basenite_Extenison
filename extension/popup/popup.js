@@ -824,6 +824,7 @@ const captureButtons = [
 function setCaptureEnabled() {
   for (const button of captureButtons) button.disabled = !ready() || busy;
   renderBulkCount();
+  renderEnrichTable();
   renderInteraction();
 }
 
@@ -1096,6 +1097,45 @@ $("bulk-btn").addEventListener("click", () => {
 function resumeBulk() {
   void start("Resuming enrich", "BULK_ENRICH_RESUME", {}, resumeBulk);
 }
+
+// Enrich a table: any column that can hold a URL, LinkedIn-named ones first.
+const URL_COLUMN_TYPES = new Set(["singleLineText", "url", "multilineText", "formula", "multipleLookupValues", "rollup", "button"]);
+const isLinkedInName = (name) => /linked\s*in/i.test(name);
+
+function urlColumns(table) {
+  return (table?.fields || [])
+    .filter((field) => URL_COLUMN_TYPES.has(field.type))
+    .sort((a, b) => isLinkedInName(b.name) - isLinkedInName(a.name));
+}
+
+function fillSelect(select, items, fallback) {
+  const keep = select.value;
+  select.replaceChildren(...items.map(({ id, name }) => new Option(name, id)));
+  select.value = items.some((item) => item.id === keep) ? keep : fallback || "";
+}
+
+function renderEnrichTable() {
+  const tables = ready() ? (config.baseTables || []).filter((table) => urlColumns(table).length) : [];
+  // Default to a table other than People that has a LinkedIn column: that's the one worth enriching.
+  const suggested = tables.find((table) => table.id !== config?.tableId && urlColumns(table).some((field) => isLinkedInName(field.name)))
+    || tables.find((table) => table.id === config?.tableId) || tables[0];
+  fillSelect($("enrich-table"), tables, suggested?.id);
+  const columns = urlColumns(tables.find((table) => table.id === $("enrich-table").value));
+  fillSelect($("enrich-field"), columns, columns[0]?.id);
+  $("enrich-table-btn").disabled = !ready() || busy || !$("enrich-field").value;
+}
+
+$("enrich-table").addEventListener("change", () => {
+  $("enrich-field").value = "";
+  renderEnrichTable();
+});
+
+$("enrich-table-btn").addEventListener("click", function enrichTable() {
+  const tableId = $("enrich-table").value;
+  const fieldId = $("enrich-field").value;
+  if (!tableId || !fieldId) return;
+  void start("Reading table", "ENRICH_FROM_TABLE", { tableId, fieldId }, enrichTable);
+});
 
 const searchResults = $("search-results");
 

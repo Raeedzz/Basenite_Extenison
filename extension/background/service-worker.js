@@ -23,6 +23,7 @@ import {
   AirtableError,
   createField,
   listBases,
+  listRecords,
   listTables,
   whoami,
 } from "../lib/airtable-client.js";
@@ -112,6 +113,7 @@ import {
   readBulkJob,
   resumeBulkEnrich,
   startBulkEnrich,
+  TABLE_MAX_URLS,
 } from "./bulk-enrich.js";
 import {
   armSessionWatchdog,
@@ -819,6 +821,9 @@ async function handleMessage(message) {
     case "BULK_ENRICH_RESUME":
       return handleBulkEnrich(null);
 
+    case "ENRICH_FROM_TABLE":
+      return handleEnrichFromTable(String(message.tableId || ""), String(message.fieldId || ""));
+
     case "AIRTABLE_GET_CONFIG":
       await repairPeopleTable("panel opened").catch(() => {});
       return publicConfig(await readConfig());
@@ -1336,6 +1341,7 @@ async function handleCancelSync() {
   //    checkpoint, and abort any request already in flight.
   await cancelLinkedInWork().catch((err) => ERR("Cancel failed:", err.message));
   cancelCompanyCapture();
+  cancelEpoch++;
   await cancelBulkEnrich().catch(() => {});
 
   // 2) Wipe SW-side progress state so the panel falls back to the select view.
@@ -1600,8 +1606,8 @@ async function handleLogInteraction(message) {
 
 // ─── Bulk enrich ─────────────────────────────────────────────────────────────
 
-/** Start a bulk enrich over pasted URLs, or resume the stored one when `urls` is null. */
-async function handleBulkEnrich(urls) {
+/** Why a bulk enrich can't start now, or null. */
+async function bulkEnrichBlocked() {
   const denied = await requireLinkedInAccess();
   if (denied) return denied;
   const lock = await readLinkedInCaptureLock();
@@ -1610,9 +1616,44 @@ async function handleBulkEnrich(urls) {
     await revealHiddenSync();
     return { error: "Another capture is running. Let it finish or stop it first." };
   }
+  return null;
+}
+
+/** Start a bulk enrich over pasted URLs, or resume the stored one when `urls` is null. */
+async function handleBulkEnrich(urls, options) {
+  const blocked = await bulkEnrichBlocked();
+  if (blocked) return blocked;
   await armRunAlarms();
-  const result = urls === null ? await resumeBulkEnrich() : await startBulkEnrich(urls);
+  const result = urls === null ? await resumeBulkEnrich() : await startBulkEnrich(urls, options);
   if (result?.error || result?.resumed === false) await maybeDisarmRunAlarms();
   if (result?.resumed === false) return { error: "There's no stopped bulk enrich to resume." };
   return result;
+}
+
+/** Text of any cell that can hold a URL: text, url, button, lookup, rollup. */
+function cellText(value) {
+  if (Array.isArray(value)) return value.map(cellText).join(" ");
+  if (value && typeof value === "object") return String(value.url || "");
+  return value == null ? "" : String(value);
+}
+
+// Bumped by Stop, so a table still being read doesn't start its enrich afterwards.
+let cancelEpoch = 0;
+
+/** Enrich everyone whose LinkedIn URL is in `fieldId` of `tableId`, into People like any other enrich. */
+async function handleEnrichFromTable(tableId, fieldId) {
+  if (isBulkEnrichRunning()) return { error: "A bulk enrich is already running." };
+  const blocked = await bulkEnrichBlocked();
+  if (blocked) return blocked;
+  const config = await readConfig();
+  if (!config.token || !config.baseId) return { error: "Connect Airtable first." };
+  const table = (config.baseTables || []).find((candidate) => candidate.id === tableId);
+  const field = table?.fields?.find((candidate) => candidate.id === fieldId);
+  if (!table || !field) return { error: "That table or column isn't in the base anymore. Reload columns and pick again." };
+  const epoch = cancelEpoch;
+  const records = await listRecords(config.token, config.baseId, tableId, { fieldIds: [fieldId] });
+  if (epoch !== cancelEpoch) return { canceled: true };
+  const urls = records.map((record) => cellText(record.fields?.[fieldId])).join("\n");
+  LOG(`Enrich from ${table.name}: ${records.length} rows read`);
+  return handleBulkEnrich(urls, { source: `Table: ${table.name}`, maxUrls: TABLE_MAX_URLS });
 }

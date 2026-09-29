@@ -242,6 +242,111 @@ test("pasted LinkedIn URLs are enriched in the background and land in Airtable",
   }
 });
 
+test("Enrich a table reads every LinkedIn URL in another table's column and enriches them into People", async () => {
+  const airtable = fakeAirtable();
+  // A second table in the base, the way a Dex export sits beside People.
+  const dex = {
+    id: "tblDex",
+    name: "Dex Contacts",
+    primaryFieldId: "fldDexName",
+    fields: [
+      { id: "fldDexName", name: "Name", type: "singleLineText" },
+      { id: "fldDexLinkedIn", name: "LinkedIn", type: "url" },
+    ],
+  };
+  const dexRows = [
+    ...Array.from({ length: 150 }, (_, index) => `https://www.linkedin.com/in/ada-number-${index % 12}/`),
+    "", "not a profile", "https://www.linkedin.com/company/acme",
+  ].map((url, index) => ({ id: `recDex${index}`, fields: url ? { fldDexLinkedIn: url } : {} }));
+  const dexReads = [];
+  const handle = airtable.handle.bind(airtable);
+  airtable.handle = async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === `/v0/meta/bases/${BASE_ID}/tables`) {
+      const body = await (await handle(input, init)).json();
+      return json({ tables: [...body.tables, dex] });
+    }
+    if (url.pathname === `/v0/${BASE_ID}/tblDex`) {
+      dexReads.push(url.searchParams.getAll("fields[]"));
+      const offset = Number(url.searchParams.get("offset")) || 0;
+      const page = dexRows.slice(offset, offset + 100);
+      return json({ records: page, ...(offset + 100 < dexRows.length ? { offset: String(offset + 100) } : {}) });
+    }
+    return handle(input, init);
+  };
+  const { fetchImpl } = network(airtable);
+  const { store, send, restore } = await bootWorker({ fetch: fetchImpl, cookies: signedInToLinkedIn });
+  try {
+    await send({ type: "AIRTABLE_CONNECT", token: "patTESTTOKEN.0123456789abcdef" });
+    const auto = await send({ type: "AIRTABLE_SELECT_TABLE", baseId: BASE_ID, tableId: TABLE_ID });
+    await send({ type: "AIRTABLE_SAVE_MAPPING", mapping: { ...auto.mapping, source: "fldSource" } });
+
+    const missing = await send({ type: "ENRICH_FROM_TABLE", tableId: "tblDex", fieldId: "fldGone" });
+    assert.match(missing.error, /isn't in the base/);
+
+    const started = await send({ type: "ENRICH_FROM_TABLE", tableId: "tblDex", fieldId: "fldDexLinkedIn" });
+    assert.equal(started.error, undefined, started.error);
+    assert.equal(started.total, 12, "duplicates, blanks and non-profile links are dropped");
+    assert.deepEqual(dexReads, [["fldDexLinkedIn"], ["fldDexLinkedIn"]], "only the URL column is read, every page");
+
+    const done = await until(() => {
+      const progress = store.get("enrich_progress");
+      return progress?.status === "complete" || progress?.status === "error" ? progress : null;
+    }, "the table enrich to finish", 60_000);
+    assert.equal(done.status, "complete", done.message);
+    assert.equal(airtable.table.records.size, 12);
+    const ada = airtable.byLinkedIn().get("https://www.linkedin.com/in/ada-number-7").fields;
+    assert.equal(ada.fldName, "Ada Number7");
+    assert.equal(ada.fldSource, "Table: Dex Contacts");
+  } finally {
+    await send({ type: "CANCEL_SYNC" }).catch(() => {});
+    restore();
+  }
+});
+
+test("Stop pressed while Enrich a table is still reading the table: nothing starts", async () => {
+  const airtable = fakeAirtable();
+  const dex = {
+    id: "tblDex", name: "Dex Contacts", primaryFieldId: "fldDexName",
+    fields: [{ id: "fldDexName", name: "Name", type: "singleLineText" }, { id: "fldDexLinkedIn", name: "LinkedIn", type: "multilineText" }],
+  };
+  let reading = null;
+  let release = null;
+  const handle = airtable.handle.bind(airtable);
+  airtable.handle = async (input, init = {}) => {
+    const url = new URL(String(input));
+    if (url.pathname === `/v0/meta/bases/${BASE_ID}/tables`) {
+      const body = await (await handle(input, init)).json();
+      return json({ tables: [...body.tables, dex] });
+    }
+    if (url.pathname === `/v0/${BASE_ID}/tblDex`) {
+      // Held open until the test has pressed Stop.
+      await new Promise((resolve) => { release = resolve; reading?.(); });
+      return json({ records: [{ id: "recDex1", fields: { fldDexLinkedIn: "https://www.linkedin.com/in/ada-number-1" } }] });
+    }
+    return handle(input, init);
+  };
+  const { linkedin, fetchImpl } = network(airtable);
+  const { store, send, restore } = await bootWorker({ fetch: fetchImpl, cookies: signedInToLinkedIn });
+  try {
+    await send({ type: "AIRTABLE_CONNECT", token: "patTESTTOKEN.0123456789abcdef" });
+    await send({ type: "AIRTABLE_SELECT_TABLE", baseId: BASE_ID, tableId: TABLE_ID });
+    const read = new Promise((resolve) => { reading = resolve; });
+    const started = send({ type: "ENRICH_FROM_TABLE", tableId: "tblDex", fieldId: "fldDexLinkedIn" });
+    await read;
+    await send({ type: "CANCEL_SYNC" });
+    release();
+    assert.deepEqual(await started, { canceled: true });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(store.get("bulk_enrich_job"), undefined);
+    assert.equal(linkedin.profileRequests, 0);
+    assert.equal(airtable.table.records.size, 0);
+  } finally {
+    await send({ type: "CANCEL_SYNC" }).catch(() => {});
+    restore();
+  }
+});
+
 test("a bulk enrich interrupted by a worker restart picks up at its next batch", async () => {
   // A restarted worker starts with empty memory; in this process the sink
   // module outlives the boot, so drop what the previous test left in it.

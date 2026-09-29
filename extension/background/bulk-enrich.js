@@ -17,6 +17,8 @@ const LOG = (...args) => console.log("[BulkEnrich]", ...args);
 
 export const BULK_JOB_KEY = "bulk_enrich_job";
 export const BULK_MAX_URLS = 2_000;
+// A whole table is read, not pasted, so it can be bigger.
+export const TABLE_MAX_URLS = 10_000;
 const BATCH_SIZE = 10;
 // Between batches, on top of the enricher's own pacing inside a batch.
 const BATCH_PAUSE_MS = [2_000, 4_000];
@@ -103,16 +105,17 @@ async function publish(job, patch = {}) {
 }
 
 /** Start a new job over `input` (text or an array of URLs). */
-export async function startBulkEnrich(input) {
+export async function startBulkEnrich(input, { source = "Bulk enrich", maxUrls = BULK_MAX_URLS } = {}) {
   if (running) return { error: "A bulk enrich is already running." };
   const urls = parseProfileUrls(input);
   if (urls.length === 0) return { error: "No LinkedIn profile URLs found. They look like linkedin.com/in/…" };
-  if (urls.length > BULK_MAX_URLS) {
-    return { error: `That's ${urls.length.toLocaleString()} profiles; enrich at most ${BULK_MAX_URLS.toLocaleString()} at a time.` };
+  if (urls.length > maxUrls) {
+    return { error: `That's ${urls.length.toLocaleString()} profiles; enrich at most ${maxUrls.toLocaleString()} at a time.` };
   }
   cancelRequested = false;
   const job = {
     id: crypto.randomUUID(),
+    source,
     urls,
     next: 0,
     created: 0,
@@ -189,7 +192,7 @@ async function runJob() {
         await setEnrichProgress({ status: "error", message: job.error, bulk: true });
         return;
       }
-      const tally = profiles.length ? await captureProfiles(profiles, { source: "Bulk enrich" }) : null;
+      const tally = profiles.length ? await captureProfiles(profiles, { source: job.source || "Bulk enrich" }) : null;
       job = {
         ...job,
         emptyFrom: profiles.length ? null : job.emptyFrom ?? job.next,

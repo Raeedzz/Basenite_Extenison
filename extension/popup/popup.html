@@ -206,6 +206,17 @@
 
     <section class="list">
       <details class="item">
+        <summary>Enrich a table</summary>
+        <div class="item-body">
+          <div class="field-row">
+            <select id="enrich-table" aria-label="Table"></select>
+            <select id="enrich-field" aria-label="LinkedIn URL column"></select>
+          </div>
+          <p class="note">Every LinkedIn URL in that column is enriched into People, the same as a sync. People already there are filled in, never duplicated.</p>
+          <button id="enrich-table-btn" class="btn" type="button" disabled>Enrich table</button>
+        </div>
+      </details>
+      <details class="item">
         <summary>Enrich LinkedIn URLs</summary>
         <div class="item-body">
           <textarea id="bulk-input" rows="4" placeholder="Paste LinkedIn profile URLs — one per line, or straight from a spreadsheet column"></textarea>
