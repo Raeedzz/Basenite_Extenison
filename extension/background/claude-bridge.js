@@ -20,7 +20,9 @@ export const BRIDGE_TYPES = new Set([
   "AIRTABLE_REFRESH_SCHEMA",
   "START_CAPTURE",
   "SET_SOFT_SYNC_PREFS",
-  "SEARCH_LINKEDIN_PEOPLE",
+  "FIND_PEOPLE",
+  "CAPTURE_SEARCH",
+  "GET_PROFILES",
   "CAPTURE_PROFILES",
   "BULK_ENRICH",
   "BULK_ENRICH_RESUME",
@@ -74,6 +76,10 @@ async function apply(on) {
 async function connect() {
   if (!enabled || socket) return;
   const port = Number((await chrome.storage.local.get(BRIDGE_PORT_KEY))[BRIDGE_PORT_KEY]) || BRIDGE_DEFAULT_PORT;
+  // A WebSocket that can't connect logs an error on chrome://extensions, every
+  // redial, while Claude isn't running; a fetch that can't connect logs nothing.
+  // So dial only once the server answers one.
+  if (!enabled || socket || !(await listening(port))) return;
   if (!enabled || socket) return;
   let ws;
   try {
@@ -93,6 +99,15 @@ async function connect() {
     socket = null;
     void setState(false);
   };
+}
+
+async function listening(port) {
+  try {
+    await fetch(`http://127.0.0.1:${port}/`, { mode: "no-cors", cache: "no-store", signal: AbortSignal.timeout(3000) });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function answer(ws, data) {

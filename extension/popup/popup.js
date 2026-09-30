@@ -820,7 +820,7 @@ $("open-linkedin-btn").addEventListener("click", () => {
 
 const captureButtons = [
   "sync-btn", "soft-sync-btn", "test-sync-btn", "profile-add-btn", "profile-mutuals-btn",
-  "company-btn", "search-btn", "search-add-btn", "search-mutuals-btn", "mutuals-btn",
+  "company-btn", "search-btn", "search-add-btn", "search-all-btn", "search-mutuals-btn", "mutuals-btn",
 ].map($);
 
 function setCaptureEnabled() {
@@ -1140,6 +1140,8 @@ $("enrich-table-btn").addEventListener("click", function enrichTable() {
 });
 
 const searchResults = $("search-results");
+// The query behind the results shown, which Add all results captures.
+let shownQuery = "";
 
 $("search-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1147,11 +1149,13 @@ $("search-form").addEventListener("submit", async (event) => {
   if (query.length < 2 || !ready()) return;
   searchResults.replaceChildren();
   $("search-actions").classList.add("hidden");
+  shownQuery = "";
   clearError();
   renderBusy("Searching LinkedIn", `“${query}”`, { cancellable: false });
   inFlight++;
   try {
     const { people = [] } = await send("SEARCH_LINKEDIN_PEOPLE", { query, limit: 25 });
+    shownQuery = query;
     renderSearchResults(people);
     renderTransient(`${formatCount(people.length)} ${people.length === 1 ? "person" : "people"} found`);
   } catch (error) {
@@ -1195,6 +1199,10 @@ $("search-add-btn").addEventListener("click", () => {
   if (urls.length) void captureProfiles(urls);
 });
 $("search-mutuals-btn").addEventListener("click", () => startMutuals(selectedSearchUrls()));
+$("search-all-btn").addEventListener("click", function addAllResults() {
+  // Pages the whole search, then enriches everyone into People like any enrich.
+  if (shownQuery) void start("Adding search results", "CAPTURE_SEARCH", { keywords: shownQuery }, addAllResults);
+});
 
 async function renderMutualPrefs() {
   const prefs = await readMutualPrefs().catch(() => normalizeMutualPrefs(null));

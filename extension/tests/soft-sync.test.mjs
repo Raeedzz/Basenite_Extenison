@@ -143,10 +143,10 @@ test("a scheduled run never competes with work already in flight", () => {
   // in soft mode — and silently, which is now stated rather than inferred from
   // the depth, because a soft sync the user requested is not silent.
   assert.match(scheduled, /startLinkedInCapture\(runId, \{ mode: "soft", silent: true, sampleLimit: null \}\)/);
-  // "Busy" covers every kind of LinkedIn work, bulk enrich included.
+  // "Busy" covers every kind of LinkedIn work, bulk enrich and a search being captured included.
   assert.match(
     SERVICE_WORKER_SOURCE,
-    /function linkedInBusy\(\) \{\s*return isCaptureRunning\(\) \|\| isEnrichmentRunning\(\) \|\| isGraphTaskRunning\(\) \|\| isBulkEnrichRunning\(\);/,
+    /function linkedInBusy\(\) \{\s*return isCaptureRunning\(\) \|\| isEnrichmentRunning\(\) \|\| isGraphTaskRunning\(\) \|\| isBulkEnrichRunning\(\) \|\| searchCapturing;/,
   );
 });
 

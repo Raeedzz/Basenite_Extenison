@@ -23,8 +23,26 @@ const log = (...args) => console.error("[basanite-mcp]", ...args);
 // ─── Tools ───────────────────────────────────────────────────────────────────
 
 const str = (description) => ({ type: "string", description });
+const list = (description) => ({ type: "array", items: { type: "string" }, maxItems: 5, description });
 const urls = (description, maxItems) => ({ type: "array", items: { type: "string" }, description, ...(maxItems ? { maxItems } : {}) });
 const READ = { readOnlyHint: true };
+
+// Every LinkedIn people-search filter, shared by search_linkedin_people and capture_search.
+const SEARCH_FILTERS = {
+  keywords: str("Free text across the whole profile, e.g. \"pytorch distributed training\""),
+  titles: list("Current title, e.g. [\"staff engineer\", \"tech lead\"]"),
+  companies: list("Current company names or linkedin.com/company URLs"),
+  pastCompanies: list("Past company names or URLs"),
+  schools: list("School names or linkedin.com/school URLs"),
+  locationIds: list("LinkedIn geo ids, e.g. \"102277331\" (San Francisco), \"103644278\" (United States), \"90000084\" (SF Bay Area)"),
+  industryIds: list("LinkedIn industry ids, e.g. \"4\" (Software Development), \"43\" (Financial Services)"),
+  profileLanguages: list("Profile language codes, e.g. \"en\""),
+  firstName: str("First name"),
+  lastName: str("Last name"),
+  degrees: { type: "array", items: { type: "string", enum: ["1st", "2nd", "3rd"] }, description: "Only these degrees from the user (3rd = 3rd and beyond). Omit for everyone." },
+  connectionOf: str("A LinkedIn profile URL: search that person's connections (only when they're visible to the user)"),
+  searchUrl: str("A linkedin.com/search/results/people/?… URL whose filters to start from"),
+};
 
 const TOOLS = [
   {
@@ -35,7 +53,7 @@ const TOOLS = [
   },
   {
     name: "get_config",
-    description: "The connected Airtable base, People table, column mapping, and every table and field in the base (enrich_table needs their ids).",
+    description: "The connected Airtable base, People table, column mapping, and every table and field in the base (enrich_table needs their ids). Names and ids only: no records — this connector can't read or search what's in the base.",
     annotations: READ,
     toMessage: () => ({ type: "AIRTABLE_GET_CONFIG" }),
     shape: trimConfig,
@@ -68,15 +86,36 @@ const TOOLS = [
   },
   {
     name: "search_linkedin_people",
-    description: "Search LinkedIn people by free text. Returns names and profile URLs; writes nothing.",
-    properties: { query: str("Search text, e.g. a name and company"), limit: { type: "number", description: "1-49, default 10" } },
-    required: ["query"],
+    description: "Full LinkedIn people search, in or out of the user's network, with every filter LinkedIn has. Searches LinkedIn, never the Airtable base. Writes nothing — to save a search's people to Airtable use capture_search. Filters combine (AND); values inside one filter are alternatives (OR). Company and school names resolve to LinkedIn's; the result says what they resolved to. Locations and industries take LinkedIn ids — or pass searchUrl: a people search the user set up on linkedin.com (any filters), and add to it. connectionOf + degrees [\"1st\"] = the user's mutuals with that person (who can introduce them). LinkedIn serves at most 1,000 results per search, so split big ones (by location, company, title). Returns names, headlines, profile URLs and degree. Page with start = nextStart.",
+    properties: {
+      ...SEARCH_FILTERS,
+      start: { type: "number", description: "Offset, from a previous nextStart" },
+      limit: { type: "number", description: "1-100, default 25" },
+    },
     annotations: READ,
-    toMessage: ({ query, limit }) => ({ type: "SEARCH_LINKEDIN_PEOPLE", query, limit }),
+    toMessage: (args) => ({ ...args, type: "FIND_PEOPLE" }),
+  },
+  {
+    name: "capture_search",
+    description: "Add everyone a LinkedIn people search finds to Airtable, with full profiles — the same filters as search_linkedin_people. Pages through every result (LinkedIn's limit is 1,000 per search; max lowers it), then runs a bulk enrich in the background: poll status (bulkEnrich) until it completes. People already in Airtable are updated, never duplicated. If nextStart comes back, the search had more than one call could page: call again with start = nextStart.",
+    properties: {
+      ...SEARCH_FILTERS,
+      start: { type: "number", description: "Offset, from a previous nextStart" },
+      max: { type: "number", description: "At most this many people, 1-1000 (default: all LinkedIn serves)" },
+    },
+    toMessage: (args) => ({ ...args, type: "CAPTURE_SEARCH" }),
+  },
+  {
+    name: "get_profiles",
+    description: "Read full LinkedIn profiles (experience with descriptions, education, skills, about) to judge who is most qualified. Writes nothing; use capture_profiles to save the chosen ones.",
+    properties: { urls: urls("LinkedIn profile URLs", 25) },
+    required: ["urls"],
+    annotations: READ,
+    toMessage: ({ urls }) => ({ type: "GET_PROFILES", urls }),
   },
   {
     name: "capture_profiles",
-    description: "Enrich up to 50 LinkedIn profiles and write them to Airtable now; waits and returns created/updated counts.",
+    description: "Add people to Airtable by LinkedIn profile URL — one person or up to 50 — with their full profile. Waits and returns created/updated counts; someone already in People is updated, never duplicated.",
     properties: { urls: urls("LinkedIn profile URLs (https://www.linkedin.com/in/...)", 50) },
     required: ["urls"],
     toMessage: ({ urls }) => ({ type: "CAPTURE_PROFILES", urls }),
@@ -259,11 +298,14 @@ async function callExtension(message) {
       resolve: (value) => { clearTimeout(timer); resolve(value); },
       reject: (error) => { clearTimeout(timer); reject(error); },
     });
-    extension.send(JSON.stringify({ id, ...message }));
+    extension.send(JSON.stringify({ ...message, id }));
   });
 }
 
-const http = createServer((req, res) => res.writeHead(426, { "content-type": "text/plain" }).end("WebSocket only\n"));
+// Plain HTTP is the extension checking the server is up before it dials (a
+// failed WebSocket dial logs an error in Chrome; a failed fetch doesn't). 204,
+// not an error status, so the check itself logs nothing either.
+const http = createServer((req, res) => res.writeHead(204).end());
 http.on("upgrade", accept);
 http.on("error", (error) => {
   if (error.code !== "EADDRINUSE") throw error;
@@ -300,7 +342,7 @@ async function handle(request) {
         protocolVersion: PROTOCOL_VERSIONS.includes(params?.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSIONS[0],
         capabilities: { tools: {} },
         serverInfo: { name: "basanite", version: "1.0.0" },
-        instructions: "Drives the Basanite Chrome extension (LinkedIn → Airtable). Long runs start in the background: poll `status` until they finish. Only one LinkedIn run at a time; `stop` ends it.",
+        instructions: "Drives the Basanite Chrome extension (LinkedIn → Airtable). It searches LinkedIn only and writes to Airtable; it cannot read or search the records in Airtable, so no tool here tells you who is already in the base (search results are LinkedIn's, not the base's). Adding someone who is already there is safe: they are updated, never duplicated. Long runs start in the background: poll `status` until they finish. Only one LinkedIn run at a time; `stop` ends it. To find the best people for something: search_linkedin_people with the filters that define the role (titles, companies, pastCompanies, schools, locations, degrees), several narrow searches rather than one broad one; get_profiles on the promising ones to rank them on their full experience; search_linkedin_people with connectionOf + degrees [\"1st\"] for who can introduce the user; capture_profiles to add the chosen people to Airtable (one URL is fine), or capture_search to add everyone a search finds. Every LinkedIn call counts toward LinkedIn's limits: on a free account, heavy searching hits LinkedIn's monthly commercial-use limit and searches then return only a few people.",
       };
     case "ping":
       return {};

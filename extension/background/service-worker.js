@@ -40,6 +40,7 @@ import {
   suggestPeopleTable,
 } from "../lib/airtable-linked.js";
 import { interactionEntry, interactionTables, logInteraction } from "../lib/airtable-interactions.js";
+import { parseSearchUrl } from "../lib/linkedin-search-url.js";
 import {
   clearConfig,
   configProblem,
@@ -104,6 +105,7 @@ import {
   enrichProfileUrls,
   findBridges,
   findPeople,
+  searchPeopleFiltered,
   isGraphTaskRunning,
   onGraphTaskSettled,
 } from "./linkedin-graph.js";
@@ -238,8 +240,13 @@ async function disarmRunAlarms() {
 // settled. Anything less either leaks a permanent keep-alive (armed for a
 // graph run that never disarms) or strips it from a run still in flight.
 function linkedInBusy() {
-  return isCaptureRunning() || isEnrichmentRunning() || isGraphTaskRunning() || isBulkEnrichRunning();
+  return isCaptureRunning() || isEnrichmentRunning() || isGraphTaskRunning() || isBulkEnrichRunning() || searchCapturing;
 }
+
+// Set while capture_search pages its search, before its bulk enrich exists:
+// nothing else may start a LinkedIn run it would then collide with.
+let searchCapturing = false;
+const SEARCH_CAPTURE_BUSY = { error: "A search is being added to Airtable. Let it finish or stop it first." };
 
 async function maybeDisarmRunAlarms() {
   if (linkedInBusy()) return;
@@ -819,6 +826,15 @@ async function handleMessage(message) {
     case "CAPTURE_PROFILES":
       return handleCaptureProfiles(message.urls);
 
+    case "FIND_PEOPLE":
+      return handleFindPeople(message);
+
+    case "CAPTURE_SEARCH":
+      return handleCaptureSearch(message);
+
+    case "GET_PROFILES":
+      return handleGetProfiles(message.urls);
+
     case "LOG_INTERACTION":
       return handleLogInteraction(message);
 
@@ -1226,6 +1242,7 @@ async function handleStartCapture(site, { force = false, mode = "full", sampleLi
   if (isBulkEnrichRunning()) {
     return { error: "A bulk enrich is running. Let it finish or stop it first." };
   }
+  if (searchCapturing) return SEARCH_CAPTURE_BUSY;
 
   // Sync pressed right after Stop: let the stopped run finish its last write,
   // then start this one fresh.
@@ -1402,6 +1419,7 @@ async function handleCompanyCapture(company, options = {}) {
   if (companyCaptureStarting || isCompanyCaptureRunning()) {
     return { error: "A company capture is already running.", busy: true };
   }
+  if (searchCapturing) return SEARCH_CAPTURE_BUSY;
   companyCaptureStarting = true;
   try {
     LOG(`Company capture: "${name}"`);
@@ -1429,6 +1447,7 @@ async function handleCompanyCapture(company, options = {}) {
 
 async function handleStartMutualFinding(contacts) {
   LOG(`[MUTUALS] ${contacts?.length || 0} contact(s)`);
+  if (searchCapturing) return SEARCH_CAPTURE_BUSY;
 
   const denied = await requireLinkedInAccess();
   if (denied) {
@@ -1526,12 +1545,172 @@ async function handleEnrichLinkedInProfiles(urls) {
   }
 }
 
+/**
+ * Claude's sourcing search: every LinkedIn people filter. A pasted LinkedIn
+ * search URL supplies its filters (locations, industries, …); the named
+ * arguments add to them and win where both set the same one.
+ */
+function peopleSearchOptions(message) {
+  const text = (value, max) => (typeof value === "string" ? value.trim().slice(0, max) : "");
+  const list = (value, valid = () => true) => (Array.isArray(value) ? value : value == null ? [] : [value])
+    .map((item) => text(String(item), 100)).filter((item) => item && valid(item)).slice(0, 5);
+  const numeric = (item) => /^\d+$/.test(item);
+  let fromUrl = { keywords: "", facets: {} };
+  if (message.searchUrl) {
+    try {
+      fromUrl = parseSearchUrl(message.searchUrl);
+    } catch (err) {
+      return { error: err.message };
+    }
+  }
+  const connectionOf = message.connectionOf ? safeLinkedInProfileUrl(message.connectionOf) : null;
+  if (message.connectionOf && !connectionOf) return { error: "connectionOf must be a LinkedIn profile URL." };
+  const options = {
+    keywords: text(message.keywords, 200) || fromUrl.keywords,
+    facets: fromUrl.facets,
+    firstName: text(message.firstName, 60),
+    lastName: text(message.lastName, 60),
+    titles: list(message.titles),
+    companies: list(message.companies),
+    pastCompanies: list(message.pastCompanies),
+    schools: list(message.schools),
+    locationIds: list(message.locationIds, numeric),
+    industryIds: list(message.industryIds, numeric),
+    profileLanguages: list(message.profileLanguages, (item) => /^[a-z]{2}$/.test(item)),
+    degrees: list(message.degrees, (item) => ["1st", "2nd", "3rd"].includes(item)),
+    connectionOf,
+    start: Number(message.start) || 0,
+  };
+  // Degree and language alone would page all of LinkedIn.
+  const urlFilters = Object.keys(options.facets).filter((key) => key !== "network" && key !== "profileLanguage");
+  const narrowed = options.keywords || urlFilters.length || connectionOf || options.firstName || options.lastName
+    || ["titles", "companies", "pastCompanies", "schools", "locationIds", "industryIds"].some((key) => options[key].length);
+  if (!narrowed) return { error: "Give keywords, a searchUrl, or at least one filter besides degree and language." };
+  return options;
+}
+
+/** Search only: writes nothing. At most 100 people a call; page with nextStart. */
+async function handleFindPeople(message) {
+  const options = peopleSearchOptions(message);
+  if (options.error) return options;
+  const denied = await requireLinkedInAccess();
+  if (denied) return denied;
+  const pageUntil = Date.now() + 200_000;
+  return runPeopleSearch({
+    ...options,
+    limit: Math.min(100, Number(message.limit) || 25),
+    stopped: () => Date.now() > pageUntil,
+  }, 240_000);
+}
+
+/**
+ * A whole search into Airtable: page every result (LinkedIn serves at most
+ * 1,000), then bulk-enrich them into People like any other enrich — full
+ * profiles, resumable, no duplicates. Returns once the enrich has started;
+ * `status` tracks it.
+ */
+async function handleCaptureSearch(message) {
+  const options = peopleSearchOptions(message);
+  if (options.error) return options;
+  if (searchCapturing) return SEARCH_CAPTURE_BUSY;
+  if (isBulkEnrichRunning()) return { error: "A bulk enrich is already running." };
+  const blocked = await bulkEnrichBlocked();
+  if (blocked) return blocked;
+  if (searchCapturing) return SEARCH_CAPTURE_BUSY;
+  const epoch = cancelEpoch;
+  const stillWanted = () => epoch === cancelEpoch;
+  // Paging stops on its own before the deadline, so a slow search still adds
+  // what it found and hands back nextStart to capture the rest.
+  // Inside the MCP call's 300s: paging, a slow last page, the wait below, the enrich start.
+  const pageUntil = Date.now() + 180_000;
+  searchCapturing = true;
+  let found;
+  try {
+    // Nothing else holds the worker up while the search pages.
+    await armRunAlarms();
+    found = await runPeopleSearch({
+      ...options,
+      limit: Math.max(1, Math.min(1000, Math.floor(Number(message.max)) || 1000)),
+      stopped: () => !stillWanted() || Date.now() > pageUntil,
+    }, 230_000);
+  } finally {
+    searchCapturing = false;
+  }
+  const settle = async (result) => {
+    await maybeDisarmRunAlarms();
+    return result;
+  };
+  if (!stillWanted()) return settle({ canceled: true });
+  if (found.error) return settle(found);
+  const { people, ...search } = found;
+  if (people.length === 0) return settle({ error: "That search found nobody to add.", ...search });
+  LOG(`Search capture: ${people.length} people found (LinkedIn reports ${search.total})`);
+  // A profile read or add Claude ran meanwhile is a short graph task: let it
+  // finish rather than throw the whole search away.
+  for (let waited = 0; isGraphTaskRunning() && stillWanted() && waited < 30_000; waited += 500) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  const started = await handleBulkEnrich(people.map((person) => person.linkedinUrl), { source: "LinkedIn search", stillWanted });
+  return { ...started, found: people.length, ...search };
+}
+
+async function runPeopleSearch(options, deadlineMs) {
+  try {
+    return await withDeadline(searchPeopleFiltered(options), deadlineMs, "LinkedIn search timed out. Try again in a moment.");
+  } catch (err) {
+    ERR("Filtered people search failed:", err.message);
+    const known = {
+      SESSION_EXPIRED: "LinkedIn session expired. Refresh LinkedIn and try again.",
+      RATE_LIMITED: "LinkedIn is rate limiting searches. Wait a few minutes before searching again.",
+      PROFILE_INACCESSIBLE: "LinkedIn won't show that profile to this account.",
+      TIMEOUT: "LinkedIn stopped responding. Try again in a minute.",
+    };
+    return { error: known[err.message] || err.message || "People search failed" };
+  }
+}
+
+/** Full profiles for judging fit, without writing anything. Pictures, logos and urns are dropped. */
+async function handleGetProfiles(urls) {
+  const list = [...new Set((Array.isArray(urls) ? urls : []).map(safeLinkedInProfileUrl).filter(Boolean))];
+  if (list.length === 0) return { error: "No LinkedIn profile URLs." };
+  if (list.length > 25) return { error: "Read at most 25 profiles at a time." };
+  const enriched = await handleEnrichLinkedInProfiles(list);
+  if (enriched.error) return enriched;
+  const cut = (value, max) => (typeof value === "string" && value.length > max ? `${value.slice(0, max)}…` : value || undefined);
+  return {
+    profiles: enriched.profiles.map((p) => ({
+      linkedinUrl: p.linkedinUrl,
+      name: p.name,
+      degree: p.connectionDegree || undefined,
+      headline: p.headline || undefined,
+      location: p.location || undefined,
+      industry: p.industry || undefined,
+      about: cut(p.bio, 1500),
+      experience: (p.experience || []).map((e) => ({
+        title: e.title, company: e.company, location: e.location || undefined,
+        start: e.startDate || undefined, end: e.isCurrent ? "present" : e.endDate || undefined,
+        description: cut(e.description, 600),
+      })),
+      education: (p.education || []).map((e) => ({
+        school: e.school, degree: e.degree || undefined, field: e.field || undefined,
+        start: e.startDate || undefined, end: e.endDate || undefined,
+      })),
+      skills: p.skills?.length ? p.skills : undefined,
+      languages: p.languages?.length ? p.languages : undefined,
+      certifications: p.certifications?.length ? p.certifications.map((c) => c.name).filter(Boolean) : undefined,
+    })),
+    failedUrls: enriched.failedUrls,
+  };
+}
+
 // ─── Profile capture ─────────────────────────────────────────────────────────
 
 function safeLinkedInProfileUrl(value) {
   if (typeof value !== "string" || value.length > 2048) return null;
   try {
-    const url = new URL(value.trim());
+    // "linkedin.com/in/x" without a scheme counts, as it does in the panel.
+    const raw = value.trim();
+    const url = new URL(/^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`);
     if (url.protocol !== "https:") return null;
     if (url.hostname !== "linkedin.com" && !url.hostname.endsWith(".linkedin.com")) return null;
     const match = url.pathname.match(/^\/in\/([^/?#]+)\/?/);
@@ -1615,6 +1794,7 @@ async function handleLogInteraction(message) {
 
 /** Why a bulk enrich can't start now, or null. */
 async function bulkEnrichBlocked() {
+  if (searchCapturing) return SEARCH_CAPTURE_BUSY;
   const denied = await requireLinkedInAccess();
   if (denied) return denied;
   const lock = await readLinkedInCaptureLock();
@@ -1631,6 +1811,11 @@ async function handleBulkEnrich(urls, options) {
   const blocked = await bulkEnrichBlocked();
   if (blocked) return blocked;
   await armRunAlarms();
+  // Stop pressed while the checks above ran: there's no job yet for it to stop.
+  if (options?.stillWanted && !options.stillWanted()) {
+    await maybeDisarmRunAlarms();
+    return { canceled: true };
+  }
   const result = urls === null ? await resumeBulkEnrich() : await startBulkEnrich(urls, options);
   if (result?.error || result?.resumed === false) await maybeDisarmRunAlarms();
   if (result?.resumed === false) return { error: "There's no stopped bulk enrich to resume." };

@@ -1299,6 +1299,110 @@ const engine = (function () {
     return parseSearchPeople(data);
   }
 
+  // ─── Filtered People Search (Claude's sourcing search) ─────────────────────
+  //
+  // The clusters endpoint with every people facet Voyager honours. Each facet
+  // name here was checked live: Voyager silently ignores one it doesn't know
+  // and returns the unfiltered results, so a wrong name looks like it works.
+  // Company and school names resolve to ids; locations and industries are ids
+  // (from a pasted search URL, or known). connectionOf with network F is the
+  // user's mutuals with someone. Pages until `limit` named people or LinkedIn
+  // runs out.
+
+  const NETWORK_CODES = { "1st": "F", "2nd": "S", "3rd": "O" };
+  // LinkedIn serves no people search past its first 1,000 results.
+  const MAX_FILTERED_RESULTS = 1000;
+
+  // A bare paren closes the Voyager query DSL early, so parens are encoded too.
+  // Rest.li 2.0 reserves ' as well (O'Brien would 400 every request).
+  const dslValue = (value) => encodeURIComponent(value).replace(/\(/g, "%28").replace(/\)/g, "%29").replace(/'/g, "%27");
+
+  async function profileIdentity(linkedinUrl) {
+    const publicId = extractPublicId(linkedinUrl);
+    if (!publicId) throw new Error(`Not a LinkedIn profile URL: ${linkedinUrl}`);
+    const identity = parseProfileIdentity(await fetchFullProfile(publicId, extractCsrfToken()), publicId);
+    if (!identity) throw new Error(`LinkedIn didn't return ${linkedinUrl}.`);
+    return identity;
+  }
+
+  async function searchPeopleFiltered({
+    keywords = "", facets: given = {}, firstName = "", lastName = "", titles = [], companies = [], pastCompanies = [],
+    schools = [], locationIds = [], industryIds = [], profileLanguages = [], degrees = [], connectionOf = null,
+    start = 0, limit = 25, stopped = () => false,
+  }) {
+    await primeCsrfToken();
+    const facets = { ...given };
+    const set = (key, values) => { if (values.length) facets[key] = values; };
+    const resolved = {};
+    let of = null;
+    if (connectionOf) {
+      of = await profileIdentity(connectionOf);
+      facets.connectionOf = [of.rawId];
+    }
+    for (const [key, names, resultType] of [
+      ["currentCompany", companies, "COMPANIES"], ["pastCompany", pastCompanies, "COMPANIES"], ["schoolFilter", schools, "SCHOOLS"],
+    ]) {
+      const matches = [];
+      for (const name of names) {
+        const match = await resolveCompanyId(name, resultType);
+        if (!match) throw new Error(`No LinkedIn ${resultType === "SCHOOLS" ? "school" : "company"} matches "${name}".`);
+        matches.push(match);
+      }
+      set(key, matches.map((match) => match.id));
+      if (matches.length) resolved[key] = matches.map((match) => match.name);
+    }
+    set("title", titles);
+    set("firstName", firstName ? [firstName] : []);
+    set("lastName", lastName ? [lastName] : []);
+    set("geoUrn", locationIds);
+    set("industry", industryIds);
+    set("profileLanguage", profileLanguages);
+    set("network", [...new Set(degrees.map((degree) => NETWORK_CODES[degree]).filter(Boolean))]);
+    const faceted = Object.keys(facets).length > 0;
+    facets.resultType = ["PEOPLE"];
+    const queryParameters = Object.keys(facets).sort()
+      .map((key) => `${key}:List(${facets[key].map(dslValue).join(",")})`).join(",");
+    const keywordClause = keywords.trim() ? `keywords:${dslValue(keywords.trim())},` : "";
+    const wanted = Math.max(1, Math.min(MAX_FILTERED_RESULTS, Math.floor(limit) || 25));
+
+    const people = [];
+    const seen = new Set();
+    let offset = Math.max(0, Math.floor(start) || 0);
+    let total = 0;
+    let exhausted = false;
+    while (people.length < wanted && !stopped()) {
+      const data = await searchApiFetch((deco) =>
+        `/voyager/api/search/dash/clusters` +
+        `?decorationId=${encodeURIComponent(deco)}` +
+        `&origin=${faceted ? "FACETED_SEARCH" : "GLOBAL_SEARCH_HEADER"}&q=all` +
+        `&query=(${keywordClause}flagshipSearchIntent:SEARCH_SRP,queryParameters:(${queryParameters}))` +
+        // Only as many as still wanted: a page cut short would move the offset
+        // past people nobody got.
+        `&start=${offset}&count=${Math.min(PER_PAGE, wanted - people.length)}`
+      );
+      total = data?.metadata?.totalResultCount || total;
+      const slots = searchResultKeys(data, offset);
+      for (const person of parseSearchPeople(data)) {
+        if (seen.has(person.linkedinUrl) || people.length >= wanted) continue;
+        seen.add(person.linkedinUrl);
+        people.push(person);
+      }
+      offset += slots.length;
+      if (slots.length === 0 || offset >= Math.min(total || Infinity, MAX_FILTERED_RESULTS)) { exhausted = true; break; }
+      if (people.length < wanted) await humanDelay(PAGE_DELAY_MS[0], PAGE_DELAY_MS[1]);
+    }
+    return {
+      people,
+      total,
+      nextStart: exhausted ? null : offset,
+      // What the names resolved to, so a wrong match is visible.
+      ...(of ? { connectionsOf: [of.firstName, of.lastName].filter(Boolean).join(" ") } : {}),
+      ...(resolved.currentCompany ? { companies: resolved.currentCompany } : {}),
+      ...(resolved.pastCompany ? { pastCompanies: resolved.pastCompany } : {}),
+      ...(resolved.schoolFilter ? { schools: resolved.schoolFilter } : {}),
+    };
+  }
+
   // ─── Company Capture ────────────────────────────────────────────────────────
   //
   // Same Voyager machinery as the bridge finder, aimed at a company instead of a
@@ -1334,10 +1438,11 @@ const engine = (function () {
   // Resolve a company reference to its numeric id. Accepts a plain name OR a
   // LinkedIn company URL/slug (linkedin.com/company/<slug>[/people/…]) — URLs
   // resolve exactly via the organization universalName lookup, names via the
-  // clusters COMPANIES search. Returns { id, name } or null.
-  async function resolveCompanyId(companyName) {
+  // clusters COMPANIES search. Returns { id, name } or null. Schools are
+  // organizations too: resultType "SCHOOLS" and linkedin.com/school/<slug>.
+  async function resolveCompanyId(companyName, resultType = "COMPANIES") {
     const reference = (companyName || "").trim();
-    const slugMatch = reference.match(/linkedin\.com\/company\/([^/?#]+)/i)
+    const slugMatch = reference.match(/linkedin\.com\/(?:company|school)\/([^/?#]+)/i)
       || (/^[a-z0-9][a-z0-9._-]*$/i.test(reference) && reference.includes("-") ? [null, reference] : null);
     if (slugMatch) {
       let slug = slugMatch[1];
@@ -1365,7 +1470,7 @@ const engine = (function () {
       `?decorationId=${encodeURIComponent(deco)}` +
       `&origin=GLOBAL_SEARCH_HEADER&q=all` +
       `&query=(keywords:${kw},flagshipSearchIntent:SEARCH_SRP,` +
-      `queryParameters:(resultType:List(COMPANIES)))` +
+      `queryParameters:(resultType:List(${resultType})))` +
       `&start=0&count=5`
     );
     const elements = data?.elements || data?.data?.elements || [];
@@ -1892,6 +1997,7 @@ const engine = (function () {
     companyDetails,
     findBridges,
     findPeople,
+    searchPeopleFiltered,
     enrichProfileUrls,
     captureCompany,
     isCompanyCaptureRunning,
@@ -1905,6 +2011,7 @@ const engine = (function () {
 export const findBridges = (targets, options) => engine.findBridges(targets, options);
 export const fetchCompanyDetails = (companyId) => engine.companyDetails(companyId);
 export const findPeople = (query, limit) => engine.findPeople(query, limit);
+export const searchPeopleFiltered = (options) => engine.searchPeopleFiltered(options);
 export const enrichProfileUrls = (urls) => engine.enrichProfileUrls(urls);
 export const captureCompany = (company, options) => engine.captureCompany(company, options);
 export const isCompanyCaptureRunning = () => engine.isCompanyCaptureRunning();
