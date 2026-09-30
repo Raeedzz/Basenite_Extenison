@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { bootWorker } from "./helpers/worker-harness.mjs";
+import { bootWorker, EXTENSION_ID } from "./helpers/worker-harness.mjs";
 import { airtableConfig, fakeAirtable } from "./helpers/fake-airtable.mjs";
 import { isBulkEnrichRunning } from "../background/bulk-enrich.js";
 
@@ -19,13 +19,15 @@ const hit = (id, distance = "DISTANCE_2") => ({ item: { entityResult: {
   navigationUrl: `https://www.linkedin.com/in/p-${id}`, entityCustomTrackingInfo: { memberDistance: distance },
 } } });
 
-function linkedin({ pages = [], total = 0, delayMs = 0 } = {}) {
+function linkedin({ pages = [], total = 0, delayMs = 0, profileDelayMs = 0, failFrom = Infinity } = {}) {
   const everyone = pages.flat();
   const searches = [];
   const raw = [];
+  const lookups = [];
   const fetch = async (input) => {
     const url = decodeURIComponent(String(input));
     if (url.includes("/search/dash/clusters")) {
+      if (/resultType:List\((COMPANIES|SCHOOLS)\)/.test(url)) lookups.push(String(input));
       if (url.includes("resultType:List(COMPANIES)")) {
         return json({ elements: [{ items: [{ item: { entityResult: { title: { text: "Acme" }, entityUrn: "urn:li:fsd_company:42" } } }] }] });
       }
@@ -37,10 +39,12 @@ function linkedin({ pages = [], total = 0, delayMs = 0 } = {}) {
       if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
       // start and count, as LinkedIn serves them.
       const start = Number(url.match(/[?&]start=(\d+)/)[1]);
+      if (start >= failFrom) return new Response("{}", { status: 500 });
       const count = Number(url.match(/[?&]count=(\d+)/)[1]);
       return json({ metadata: { totalResultCount: total }, elements: [{ items: everyone.slice(start, start + count) }] });
     }
     if (url.includes("memberIdentity=")) {
+      if (profileDelayMs) await new Promise((resolve) => setTimeout(resolve, profileDelayMs));
       const id = url.match(/memberIdentity=([^&]+)/)[1];
       return json({ elements: [{
         entityUrn: `urn:li:fsd_profile:ACoAA-${id}`, publicIdentifier: id, firstName: "Jane", lastName: "Doe", headline: "Head of ML",
@@ -53,7 +57,7 @@ function linkedin({ pages = [], total = 0, delayMs = 0 } = {}) {
     }
     return json({});
   };
-  return { fetch, searches, raw };
+  return { fetch, searches, raw, lookups };
 }
 
 async function boot(fetch, config = airtableConfig()) {
@@ -255,6 +259,67 @@ test("while capture_search pages, nothing else starts a LinkedIn run, and the wo
   }
 });
 
+test("a later page failing keeps everyone already found, says why, and where to continue", async () => {
+  const page = (from) => Array.from({ length: 49 }, (_, i) => hit(from + i));
+  const li = linkedin({ pages: [page(0), page(49), page(98)], total: 147, failFrom: 98 });
+  const worker = await boot(li.fetch);
+  try {
+    const found = await worker.send({ type: "FIND_PEOPLE", keywords: "engineer", limit: 100 });
+    assert.equal(found.error, undefined, found.error);
+    assert.equal(found.people.length, 98);
+    assert.equal(found.nextStart, 98);
+    assert.match(found.warning, /Stopped early at 98: LinkedIn search failed \(500\).*start = nextStart/);
+    assert.ok(found.people.every((person) => !("photoUrl" in person)), "no picture links for Claude");
+    const captured = await worker.send({ type: "CAPTURE_SEARCH", keywords: "engineer" });
+    assert.deepEqual([captured.started, captured.found, captured.nextStart], [true, 98, 98], JSON.stringify(captured));
+    assert.match(captured.warning, /Stopped early/);
+    await until(() => worker.store.get("bulk_enrich_job")?.status === "complete", "the enrich", 90_000);
+  } finally {
+    await worker.send({ type: "CANCEL_SYNC" }).catch(() => {});
+    await until(() => !isBulkEnrichRunning(), "the enrich to stop");
+    worker.restore();
+  }
+});
+
+test("capture_search input: max must be at least 1; names with parens stay inside the query", async () => {
+  const li = linkedin({ pages: [[hit(1)]], total: 1 });
+  const worker = await boot(li.fetch);
+  try {
+    for (const max of [0, 0.5, -3, "lots"]) {
+      assert.match((await worker.send({ type: "CAPTURE_SEARCH", keywords: "x", max })).error || "", /max must be/, String(max));
+    }
+    assert.equal(li.searches.length, 0);
+    await worker.send({ type: "FIND_PEOPLE", schools: ["King's College (London)"] });
+    const lookup = li.lookups.find((url) => url.includes("SCHOOLS"));
+    assert.ok(lookup.includes("keywords:King%27s%20College%20%28London%29,"), lookup);
+    const far = await worker.send({ type: "FIND_PEOPLE", keywords: "x", start: 1e999 });
+    assert.deepEqual([far.people.length, far.nextStart], [0, null], "nothing past LinkedIn's 1,000");
+  } finally {
+    worker.restore();
+  }
+});
+
+test("a profile read still running when paging ends: capture waits for it and keeps the slot", async () => {
+  const li = linkedin({ pages: [[hit(1), hit(2), hit(3)]], total: 3, delayMs: 600, profileDelayMs: 2500 });
+  const worker = await boot(li.fetch);
+  try {
+    const capture = worker.send({ type: "CAPTURE_SEARCH", keywords: "x" });
+    await until(() => li.searches.length >= 1, "the search");
+    // Claude reads a profile while the search pages; the read outlasts the paging.
+    const reading = worker.send({ type: "GET_PROFILES", urls: ["https://www.linkedin.com/in/slow"] });
+    await new Promise((r) => setTimeout(r, 1200));
+    const mutuals = await worker.send({ type: "START_MUTUAL_FINDING", contacts: [{ linkedinUrl: "https://www.linkedin.com/in/x" }] });
+    assert.match(mutuals.error || "", /search is being added/, "the slot is still held while capture waits");
+    assert.equal((await reading).error, undefined);
+    const result = await capture;
+    assert.deepEqual([result.started, result.found], [true, 3], JSON.stringify(result));
+  } finally {
+    await worker.send({ type: "CANCEL_SYNC" }).catch(() => {});
+    await until(() => !isBulkEnrichRunning(), "the enrich to stop");
+    worker.restore();
+  }
+});
+
 test("Stop during a capture_search's paging adds nobody", async () => {
   const page = (from) => Array.from({ length: 49 }, (_, i) => hit(from + i));
   const li = linkedin({ pages: Array.from({ length: 20 }, (_, i) => page(i * 49)), total: 1000 });
@@ -293,7 +358,8 @@ test("with Claude control on and no server running, the extension never dials (a
     await until(() => probes.length >= 5, "the bridge to check every port for a server");
     await new Promise((r) => setTimeout(r, 200));
     // One server per Claude session, each on the next port up.
-    assert.deepEqual(probes.sort(), [17899, 17900, 17901, 17902, 17903].map((port) => `http://127.0.0.1:${port}/`));
+    // Each check names this extension, so another extension's server doesn't answer it.
+    assert.deepEqual(probes.sort(), [17899, 17900, 17901, 17902, 17903].map((port) => `http://127.0.0.1:${port}/?ext=${EXTENSION_ID}`));
     assert.deepEqual(dials, [], "no WebSocket while nothing listens");
   } finally {
     await worker.send({ type: "CANCEL_SYNC" }).catch(() => {});

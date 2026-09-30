@@ -6,7 +6,8 @@
 export const CONNECTOR_FILE = "basanite.mcpb";
 const ENTRY = "server/basanite-mcp.mjs";
 
-export function connectorManifest({ extensionId, version, port = null }) {
+/** `secret` is this install's bridge secret (claude_bridge_secret): the server proves itself with it. */
+export function connectorManifest({ extensionId, version, port = null, secret = null }) {
   return {
     manifest_version: "0.2",
     name: "basanite",
@@ -22,7 +23,11 @@ export function connectorManifest({ extensionId, version, port = null }) {
       mcp_config: {
         command: "node",
         args: [`\${__dirname}/${ENTRY}`],
-        env: { BASANITE_EXTENSION_ID: extensionId, ...(port ? { BASANITE_MCP_PORT: String(port) } : {}) },
+        env: {
+          BASANITE_EXTENSION_ID: extensionId,
+          ...(port ? { BASANITE_MCP_PORT: String(port) } : {}),
+          ...(secret ? { BASANITE_SECRET: secret } : {}),
+        },
       },
     },
     tools_generated: true,

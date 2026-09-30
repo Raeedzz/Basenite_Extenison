@@ -9,6 +9,13 @@ import { BULK_JOB_KEY } from "./bulk-enrich.js";
 export const BRIDGE_ENABLED_KEY = "claude_bridge_enabled";
 export const BRIDGE_STATE_KEY = "claude_bridge_state";
 const BRIDGE_PORT_KEY = "claude_bridge_port";
+// Made by the panel with the connector, which carries it to the server. A server
+// that can't present it gets no answers: any program on the computer could
+// otherwise pose as Claude and drive the user's LinkedIn and Airtable.
+export const BRIDGE_SECRET_KEY = "claude_bridge_secret";
+const PROOF_WAIT_MS = 5_000;
+const REFUSAL = "This Basanite connector wasn't made by this browser's Basanite extension (or is out of date). "
+  + "In the extension's panel press Re-download, double-click the file to install it, then quit and reopen Claude.";
 export const BRIDGE_DEFAULT_PORT = 17891;
 // Every Claude session runs its own MCP server, each on the first free port from
 // the base up (mcp/basanite-mcp.mjs); one socket per server.
@@ -39,6 +46,7 @@ export const BRIDGE_TYPES = new Set([
 let handle = null;
 let enabled = false;
 const sockets = new Map(); // port → WebSocket
+const trusted = new WeakSet(); // sockets whose server presented the secret
 const dialing = new Set();
 // Toggles apply in order, so on-off-on can't finish with the off.
 let applying = Promise.resolve();
@@ -47,10 +55,10 @@ let applying = Promise.resolve();
 export function startClaudeBridge(handler) {
   handle = handler;
   chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === BRIDGE_ALARM) void connect();
+    if (alarm.name === BRIDGE_ALARM) void connect().catch(() => {});
   });
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === "local" && BRIDGE_ENABLED_KEY in changes) void queueApply(changes[BRIDGE_ENABLED_KEY].newValue === true);
+    if (area === "local" && BRIDGE_ENABLED_KEY in changes) void queueApply(changes[BRIDGE_ENABLED_KEY].newValue === true).catch(() => {});
   });
   return chrome.storage.local.get([BRIDGE_ENABLED_KEY, BRIDGE_STATE_KEY]).then(async (stored) => {
     // A fresh worker has no socket, whatever the last one left in storage.
@@ -73,7 +81,11 @@ async function apply(on) {
   await chrome.alarms.clear(BRIDGE_ALARM);
   const open = [...sockets.values()];
   sockets.clear();
-  for (const ws of open) ws.close();
+  // Closing one still connecting logs an error in Chrome; it closes once open instead.
+  for (const ws of open) {
+    if (ws.readyState === WebSocket.CONNECTING) ws.onopen = () => ws.close();
+    else ws.close();
+  }
   await setState(false);
 }
 
@@ -91,6 +103,8 @@ async function dial(port) {
     // redial, while Claude isn't running; a fetch that can't connect logs nothing.
     // So dial only once the server answers one.
     if (!(await listening(port)) || !enabled || sockets.has(port)) return;
+    const secret = (await chrome.storage.local.get(BRIDGE_SECRET_KEY))[BRIDGE_SECRET_KEY];
+    if (!enabled || sockets.has(port)) return;
     let ws;
     try {
       ws = new WebSocket(`ws://127.0.0.1:${port}`);
@@ -98,16 +112,45 @@ async function dial(port) {
       return;
     }
     sockets.set(port, ws);
+    let outdated = false;
+    // A connector from before the secret (or another install's) never proves itself.
+    const refuse = () => {
+      if (trusted.has(ws)) return;
+      outdated = true;
+      // Said before closing, so Claude can tell the user what to do.
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ refused: REFUSAL }));
+      ws.close();
+    };
+    let proofTimer = null;
     ws.onopen = () => {
       ws.send(JSON.stringify({ hello: { version: chrome.runtime.getManifest().version } }));
-      void setState(true);
+      if (!trusted.has(ws)) proofTimer = setTimeout(refuse, PROOF_WAIT_MS);
     };
-    ws.onmessage = (event) => void answer(ws, event.data);
+    ws.onmessage = (event) => {
+      if (trusted.has(ws)) return void answer(ws, event.data).catch(() => {});
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (!message?.welcome) return; // nothing is answered before the proof
+      if (secret && message.welcome.secret === secret) {
+        trusted.add(ws);
+        clearTimeout(proofTimer);
+        void setState(true);
+      } else {
+        clearTimeout(proofTimer);
+        refuse();
+      }
+    };
     // A failed dial closes too; the alarm tries again.
     ws.onclose = () => {
+      clearTimeout(proofTimer);
       if (sockets.get(port) !== ws) return;
       sockets.delete(port);
-      void setState([...sockets.values()].some((open) => open.readyState === WebSocket.OPEN));
+      const connected = [...sockets.values()].some((open) => trusted.has(open) && open.readyState === WebSocket.OPEN);
+      void setState(connected, outdated ? { outdated: true } : {});
     };
   } finally {
     dialing.delete(port);
@@ -116,7 +159,9 @@ async function dial(port) {
 
 async function listening(port) {
   try {
-    await fetch(`http://127.0.0.1:${port}/`, { mode: "no-cors", cache: "no-store", signal: AbortSignal.timeout(3000) });
+    // A server for another extension (or anything else on the port) must not
+    // answer: its WebSocket would refuse this origin, and that refusal logs an error.
+    await fetch(`http://127.0.0.1:${port}/?ext=${chrome.runtime.id}`, { mode: "no-cors", cache: "no-store", signal: AbortSignal.timeout(3000) });
     return true;
   } catch {
     return false;
@@ -133,7 +178,13 @@ async function answer(ws, data) {
   if (message?.id == null) return; // keep-alive ping
   const { id, ...request } = message;
   const result = await dispatch(request).catch((error) => ({ error: error?.message || String(error) }));
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ id, result }));
+  let reply;
+  try {
+    reply = JSON.stringify({ id, result });
+  } catch (error) {
+    reply = JSON.stringify({ id, result: { error: `Couldn't send the answer: ${error.message}` } });
+  }
+  if (ws.readyState === WebSocket.OPEN) ws.send(reply);
 }
 
 export async function dispatch(message) {
@@ -156,6 +207,6 @@ async function status() {
   };
 }
 
-function setState(connected) {
-  return chrome.storage.local.set({ [BRIDGE_STATE_KEY]: { connected, at: Date.now() } }).catch(() => {});
+function setState(connected, extra = {}) {
+  return chrome.storage.local.set({ [BRIDGE_STATE_KEY]: { connected, at: Date.now(), ...extra } }).catch(() => {});
 }

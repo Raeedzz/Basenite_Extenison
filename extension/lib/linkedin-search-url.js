@@ -42,7 +42,7 @@ export function parseSearchUrl(value) {
     } catch {
       values = raw.split(",");
     }
-    values = (Array.isArray(values) ? values : [values]).map(String).filter((item) => valid.test(item));
+    values = (Array.isArray(values) ? values : [values]).map(String).filter((item) => valid.test(item)).slice(0, 10);
     if (values.length) facets[key] = values;
   }
   for (const [param, key] of Object.entries(TEXT_FACETS)) {

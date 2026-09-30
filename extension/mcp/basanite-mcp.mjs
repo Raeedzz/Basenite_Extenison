@@ -11,7 +11,11 @@
  * takes the first free port from BASANITE_MCP_PORT up, and the extension dials
  * them all, so up to PORT_RANGE sessions use it at once.
  *
- * Env: BASANITE_MCP_PORT (17891), BASANITE_EXTENSION_ID (the unpacked extension's id).
+ * The extension answers nothing until the server presents this install's secret,
+ * so no other program on the computer can pose as Claude and drive it.
+ *
+ * Env: BASANITE_MCP_PORT (17891), BASANITE_EXTENSION_ID (the unpacked extension's id),
+ * BASANITE_SECRET (the extension's claude_bridge_secret; the connector carries it).
  */
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
@@ -19,7 +23,9 @@ import { createInterface } from "node:readline";
 
 const BASE_PORT = Number(process.env.BASANITE_MCP_PORT) || 17891;
 const PORT_RANGE = 5; // the extension dials BASE_PORT … BASE_PORT + 4 (claude-bridge.js)
-const ORIGIN = `chrome-extension://${process.env.BASANITE_EXTENSION_ID || "cfpkjnakokdcflgklcgmkofjfkgehoia"}`;
+const EXTENSION_ID = process.env.BASANITE_EXTENSION_ID || "cfpkjnakokdcflgklcgmkofjfkgehoia";
+const ORIGIN = `chrome-extension://${EXTENSION_ID}`;
+const SECRET = process.env.BASANITE_SECRET || null;
 const CALL_TIMEOUT_MS = 300_000;
 const CONNECT_WAIT_MS = 45_000; // the extension redials every 30s, after a check of up to 3s
 const MAX_FRAME = 16 * 1024 * 1024;
@@ -102,7 +108,7 @@ const TOOLS = [
   },
   {
     name: "capture_search",
-    description: "Add everyone a LinkedIn people search finds to Airtable, with full profiles — the same filters as search_linkedin_people. Pages through every result (LinkedIn's limit is 1,000 per search; max lowers it), then runs a bulk enrich in the background: poll status (bulkEnrich) until it completes. People already in Airtable are updated, never duplicated. If nextStart comes back, the search had more than one call could page: call again with start = nextStart.",
+    description: "Add everyone a LinkedIn people search finds to Airtable, with full profiles — the same filters as search_linkedin_people. Pages through every result (LinkedIn's limit is 1,000 per search; max lowers it), then runs a bulk enrich in the background: poll status (bulkEnrich) until it completes. People already in Airtable are updated, never duplicated. If nextStart comes back (a warning says why), the rest wasn't added: once status shows the enrich finished, call again with start = nextStart.",
     properties: {
       ...SEARCH_FILTERS,
       start: { type: "number", description: "Offset, from a previous nextStart" },
@@ -192,6 +198,7 @@ function trimConfig(config) {
 // ─── Extension link (WebSocket server) ───────────────────────────────────────
 
 let extension = null; // { send, close }
+let refusal = null; // { reason, at }: the extension's last word when it refused this server
 let portTaken = false;
 let nextId = 1;
 const pending = new Map();
@@ -222,8 +229,8 @@ function accept(req, socket, head) {
     send: (text) => socket.writable && socket.write(frame(1, Buffer.from(text))),
     close: () => socket.destroy(),
   };
-  extension?.close(); // the newest worker wins
-  extension = link;
+  // First thing on every connection: the proof the extension waits for.
+  link.send(JSON.stringify({ welcome: { secret: SECRET } }));
   // Any message counts as activity that keeps the extension's worker alive.
   const ping = setInterval(() => link.send('{"ping":1}'), 20_000);
 
@@ -251,7 +258,7 @@ function accept(req, socket, head) {
       if (!fin) continue;
       const text = Buffer.concat(parts).toString("utf8");
       parts = [];
-      fromExtension(text);
+      fromExtension(text, link);
     }
   };
   socket.on("data", read);
@@ -262,19 +269,52 @@ function accept(req, socket, head) {
     for (const [id, call] of pending) {
       if (call.link !== link) continue;
       pending.delete(id);
-      call.reject(new Error("The extension disconnected mid-call (its worker restarted?). Check status before retrying."));
+      call.reject(new Error(link.refused || "The extension disconnected mid-call (its worker restarted?). Check status before retrying."));
     }
     if (extension !== link) return;
     extension = null;
     log("extension disconnected");
   });
-  log("extension connected");
-  for (const wake of waiters) wake();
+  const promote = () => {
+    extension?.close();
+    extension = link;
+    refusal = null;
+    log("extension connected");
+    for (const wake of waiters) wake();
+  };
+  if (!extension) return promote();
+  // A restarted worker replaces its dead socket; a second browser (another Chrome
+  // profile with the extension) must not keep taking the connection back and
+  // failing the calls in flight. The one that still answers stays.
+  const current = extension;
+  void answers(current).then((alive) => {
+    if (socket.destroyed) return;
+    if (!alive || extension !== current) return promote();
+    log("another browser connected; keeping the one already connected");
+    socket.end(frame(8, Buffer.from([0x0f, 0xa0]))); // close 4000
+  });
 }
 
-function fromExtension(text) {
+/** Whether `link` answers a status call quickly. */
+function answers(link, ms = 1_500) {
+  return new Promise((resolve) => {
+    const id = nextId++;
+    const timer = setTimeout(() => { pending.delete(id); resolve(false); }, ms);
+    const done = (alive) => { clearTimeout(timer); resolve(alive); };
+    pending.set(id, { link, resolve: () => done(true), reject: () => done(false) });
+    link.send(JSON.stringify({ type: "STATUS", id }));
+  });
+}
+
+function fromExtension(text, link) {
   let message;
   try { message = JSON.parse(text); } catch { return; }
+  if (!message || typeof message !== "object") return;
+  if (typeof message.refused === "string") {
+    link.refused = message.refused.slice(0, 500);
+    refusal = { reason: link.refused, at: Date.now() };
+    return log(`the extension refused this server: ${link.refused}`);
+  }
   if (message.hello) return log(`extension ${message.hello.version || "?"} says hello`);
   const call = pending.get(message.id);
   if (!call) return;
@@ -284,6 +324,8 @@ function fromExtension(text) {
 
 async function waitForExtension() {
   if (extension) return;
+  // Refused once, refused again on every redial until the user reinstalls: no point waiting.
+  if (refusal && Date.now() - refusal.at < 120_000) throw new Error(refusal.reason);
   if (portTaken) {
     throw new Error(`Ports ${BASE_PORT}–${BASE_PORT + PORT_RANGE - 1} are all taken: ${PORT_RANGE} other Claude sessions have Basanite open. Close one of them (another chat, task, or Claude Code window), then try again.`);
   }
@@ -292,6 +334,7 @@ async function waitForExtension() {
     const timer = setTimeout(done, CONNECT_WAIT_MS);
     waiters.add(done);
   });
+  if (!extension && refusal && Date.now() - refusal.at < 120_000) throw new Error(refusal.reason);
   if (!extension) throw new Error("The Basanite extension isn't connected. Chrome must be open with the extension loaded, and \"Claude control\" turned on in its panel.");
 }
 
@@ -311,8 +354,14 @@ async function callExtension(message) {
 
 // Plain HTTP is the extension checking the server is up before it dials (a
 // failed WebSocket dial logs an error in Chrome; a failed fetch doesn't). 204,
-// not an error status, so the check itself logs nothing either.
-const http = createServer((req, res) => res.writeHead(204).end());
+// not an error status, so the check itself logs nothing either. Another
+// extension's check gets no answer at all: it would dial, be refused below, and
+// that refusal logs an error in its Chrome.
+const http = createServer((req, res) => {
+  const ext = new URL(req.url, "http://127.0.0.1").searchParams.get("ext");
+  if (ext !== null && ext !== EXTENSION_ID) return req.socket.destroy();
+  res.writeHead(204).end();
+});
 http.on("upgrade", accept);
 // Another session's server on a port: take the next one.
 let offset = 0;
@@ -377,6 +426,9 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
   if (!line.trim()) return;
   let request;
   try { request = JSON.parse(line); } catch { return write({ id: null, error: { code: -32700, message: "Parse error" } }); }
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    return write({ id: null, error: { code: -32600, message: "Invalid request" } });
+  }
   try {
     const result = await handle(request);
     if (request.id !== undefined) write({ id: request.id, result });

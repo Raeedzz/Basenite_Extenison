@@ -1596,11 +1596,14 @@ async function handleFindPeople(message) {
   const denied = await requireLinkedInAccess();
   if (denied) return denied;
   const pageUntil = Date.now() + 200_000;
-  return runPeopleSearch({
+  const found = await runPeopleSearch({
     ...options,
     limit: Math.min(100, Number(message.limit) || 25),
     stopped: () => Date.now() > pageUntil,
   }, 240_000);
+  if (found.error) return found;
+  // Claude reads these: the picture links are only noise in its context.
+  return { ...found, people: found.people.map(({ photoUrl, ...person }) => person) };
 }
 
 /**
@@ -1610,62 +1613,77 @@ async function handleFindPeople(message) {
  * `status` tracks it.
  */
 async function handleCaptureSearch(message) {
+  // Read first, so a Stop pressed during the checks below counts.
+  const epoch = cancelEpoch;
+  const stillWanted = () => epoch === cancelEpoch;
   const options = peopleSearchOptions(message);
   if (options.error) return options;
+  let max = 1000;
+  if (message.max != null) {
+    max = Math.floor(Number(message.max));
+    if (!(max >= 1)) return { error: "max must be a whole number from 1 to 1000." };
+    max = Math.min(1000, max);
+  }
   if (searchCapturing) return SEARCH_CAPTURE_BUSY;
   if (isBulkEnrichRunning()) return { error: "A bulk enrich is already running." };
   const blocked = await bulkEnrichBlocked();
   if (blocked) return blocked;
   if (searchCapturing) return SEARCH_CAPTURE_BUSY;
-  const epoch = cancelEpoch;
-  const stillWanted = () => epoch === cancelEpoch;
-  // Paging stops on its own before the deadline, so a slow search still adds
-  // what it found and hands back nextStart to capture the rest.
+  if (!stillWanted()) return { canceled: true };
   // Inside the MCP call's 300s: paging, a slow last page, the wait below, the enrich start.
-  const pageUntil = Date.now() + 180_000;
+  const pageUntil = Date.now() + 150_000;
+  // Held until the enrich owns the people, so nothing else can take the slot in between.
   searchCapturing = true;
-  let found;
+  let result;
   try {
     // Nothing else holds the worker up while the search pages.
     await armRunAlarms();
-    found = await runPeopleSearch({
+    const found = await runPeopleSearch({
       ...options,
-      limit: Math.max(1, Math.min(1000, Math.floor(Number(message.max)) || 1000)),
+      limit: max,
       stopped: () => !stillWanted() || Date.now() > pageUntil,
-    }, 230_000);
+    }, 200_000);
+    if (!stillWanted()) result = { canceled: true };
+    else if (found.error) result = found;
+    else if (found.people.length === 0) result = { ...found, people: undefined, error: "That search found nobody to add." };
+    else {
+      const { people, ...search } = found;
+      LOG(`Search capture: ${people.length} people found (LinkedIn reports ${search.total})`);
+      // A profile read or add Claude ran meanwhile is a short graph task: let it
+      // finish rather than throw the whole search away.
+      for (let waited = 0; isGraphTaskRunning() && stillWanted() && waited < 20_000; waited += 500) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      const started = stillWanted()
+        ? await handleBulkEnrich(people.map((person) => person.linkedinUrl), { source: "LinkedIn search", stillWanted, searchCapture: true })
+        : { canceled: true };
+      result = { ...started, found: people.length, ...search };
+    }
   } finally {
     searchCapturing = false;
   }
-  const settle = async (result) => {
-    await maybeDisarmRunAlarms();
-    return result;
-  };
-  if (!stillWanted()) return settle({ canceled: true });
-  if (found.error) return settle(found);
-  const { people, ...search } = found;
-  if (people.length === 0) return settle({ error: "That search found nobody to add.", ...search });
-  LOG(`Search capture: ${people.length} people found (LinkedIn reports ${search.total})`);
-  // A profile read or add Claude ran meanwhile is a short graph task: let it
-  // finish rather than throw the whole search away.
-  for (let waited = 0; isGraphTaskRunning() && stillWanted() && waited < 30_000; waited += 500) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  }
-  const started = await handleBulkEnrich(people.map((person) => person.linkedinUrl), { source: "LinkedIn search", stillWanted });
-  return { ...started, found: people.length, ...search };
+  if (!result.started) await maybeDisarmRunAlarms();
+  return result;
 }
+
+const SEARCH_FAILURES = {
+  SESSION_EXPIRED: "LinkedIn session expired. Refresh LinkedIn and try again.",
+  RATE_LIMITED: "LinkedIn is rate limiting searches. Wait a few minutes before searching again.",
+  PROFILE_INACCESSIBLE: "LinkedIn won't show that profile to this account.",
+  TIMEOUT: "LinkedIn stopped responding. Try again in a minute.",
+};
+const searchFailure = (code) => SEARCH_FAILURES[code]
+  || (/^API_ERROR_\d+$/.test(code) ? `LinkedIn search failed (${code.slice(10)}). Try again in a minute.` : code);
 
 async function runPeopleSearch(options, deadlineMs) {
   try {
-    return await withDeadline(searchPeopleFiltered(options), deadlineMs, "LinkedIn search timed out. Try again in a moment.");
+    const { stoppedEarly, ...found } = await withDeadline(searchPeopleFiltered(options), deadlineMs, "LinkedIn search timed out. Try again in a moment.");
+    return stoppedEarly
+      ? { ...found, warning: `Stopped early at ${found.nextStart}: ${searchFailure(stoppedEarly)} Continue with start = nextStart.` }
+      : found;
   } catch (err) {
     ERR("Filtered people search failed:", err.message);
-    const known = {
-      SESSION_EXPIRED: "LinkedIn session expired. Refresh LinkedIn and try again.",
-      RATE_LIMITED: "LinkedIn is rate limiting searches. Wait a few minutes before searching again.",
-      PROFILE_INACCESSIBLE: "LinkedIn won't show that profile to this account.",
-      TIMEOUT: "LinkedIn stopped responding. Try again in a minute.",
-    };
-    return { error: known[err.message] || err.message || "People search failed" };
+    return { error: searchFailure(err.message) || "People search failed" };
   }
 }
 
@@ -1793,8 +1811,9 @@ async function handleLogInteraction(message) {
 // ─── Bulk enrich ─────────────────────────────────────────────────────────────
 
 /** Why a bulk enrich can't start now, or null. */
-async function bulkEnrichBlocked() {
-  if (searchCapturing) return SEARCH_CAPTURE_BUSY;
+async function bulkEnrichBlocked({ searchCapture = false } = {}) {
+  // capture_search's own hand-off is the one enrich allowed while it holds the flag.
+  if (searchCapturing && !searchCapture) return SEARCH_CAPTURE_BUSY;
   const denied = await requireLinkedInAccess();
   if (denied) return denied;
   const lock = await readLinkedInCaptureLock();
@@ -1808,7 +1827,7 @@ async function bulkEnrichBlocked() {
 
 /** Start a bulk enrich over pasted URLs, or resume the stored one when `urls` is null. */
 async function handleBulkEnrich(urls, options) {
-  const blocked = await bulkEnrichBlocked();
+  const blocked = await bulkEnrichBlocked({ searchCapture: options?.searchCapture === true });
   if (blocked) return blocked;
   await armRunAlarms();
   // Stop pressed while the checks above ran: there's no job yet for it to stop.

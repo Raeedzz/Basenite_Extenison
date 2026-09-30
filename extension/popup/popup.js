@@ -1260,6 +1260,17 @@ $("soft-times").addEventListener("change", saveSoftSync);
 
 const CLAUDE_ENABLED_KEY = "claude_bridge_enabled";
 const CLAUDE_STATE_KEY = "claude_bridge_state";
+// The connector carries it; the extension answers only a server that presents it.
+const CLAUDE_SECRET_KEY = "claude_bridge_secret";
+
+/** This install's secret, made on the first download and kept, so connectors already installed stay valid. */
+async function claudeSecret() {
+  const { [CLAUDE_SECRET_KEY]: stored } = await chrome.storage.local.get(CLAUDE_SECRET_KEY);
+  if (typeof stored === "string" && stored.length >= 32) return stored;
+  const secret = [...crypto.getRandomValues(new Uint8Array(32))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  await chrome.storage.local.set({ [CLAUDE_SECRET_KEY]: secret });
+  return secret;
+}
 
 // Set once the connector is downloaded, so the waiting line says what to do next.
 let claudeDownloaded = false;
@@ -1268,13 +1279,20 @@ async function renderClaudeControl() {
   const stored = await chrome.storage.local.get([CLAUDE_ENABLED_KEY, CLAUDE_STATE_KEY]);
   const on = stored[CLAUDE_ENABLED_KEY] === true;
   const connected = on && stored[CLAUDE_STATE_KEY]?.connected === true;
+  const outdated = on && !connected && stored[CLAUDE_STATE_KEY]?.outdated === true;
   $("claude-enabled").checked = on;
-  $("claude-setup-btn").textContent = connected ? "Re-download" : "Connect Claude";
+  $("claude-setup-btn").textContent = connected || outdated ? "Re-download" : "Connect Claude";
   $("claude-status").textContent = !on ? ""
     : connected ? "Connected to Claude."
+      : outdated ? "Claude has an out-of-date Basanite connector. Press Re-download, double-click the file to install it, then quit and reopen Claude."
       : claudeDownloaded ? `Downloaded ${CONNECTOR_FILE}. Double-click it in Downloads and press Install in Claude. This says Connected once it's in (up to 30s).`
         : "Waiting for Claude. Not set up yet? Press Connect Claude.";
 }
+
+// The switch is the off button too: off closes every connection and stops the redials.
+$("claude-enabled").addEventListener("change", (event) => {
+  void chrome.storage.local.set({ [CLAUDE_ENABLED_KEY]: event.target.checked }).catch(() => {});
+});
 
 $("claude-setup-btn").addEventListener("click", async () => {
   try {
@@ -1286,6 +1304,7 @@ $("claude-setup-btn").addEventListener("click", async () => {
       extensionId: chrome.runtime.id,
       version: chrome.runtime.getManifest().version,
       port: port || null,
+      secret: await claudeSecret(),
     });
     const link = Object.assign(document.createElement("a"), {
       href: URL.createObjectURL(new Blob([file], { type: "application/zip" })), download: CONNECTOR_FILE,

@@ -32,6 +32,7 @@ test("the connector unzips to the server, byte for byte, with this extension's i
   assert.equal(manifest.server.type, "node");
   assert.deepEqual(manifest.server.mcp_config.env, { BASANITE_EXTENSION_ID: ID });
   assert.equal(install({ port: 18000 }).manifest.server.mcp_config.env.BASANITE_MCP_PORT, "18000");
+  assert.equal(install({ secret: "s3cr3t" }).manifest.server.mcp_config.env.BASANITE_SECRET, "s3cr3t", "the connector carries the bridge secret");
   assert.equal(install({ version: "1.1" }).manifest.version, "1.1.0", "Chrome's short versions become semver");
   assert.equal(install({ version: "1.2.3.4" }).manifest.version, "1.2.3");
 });

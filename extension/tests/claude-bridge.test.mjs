@@ -39,9 +39,12 @@ const freePort = () => new Promise((resolve) => {
 });
 
 /** The MCP server as Claude Code runs it: a child speaking JSON-RPC on stdio. */
-function startServer(port) {
+// The bridge secret, as the panel makes it and the connector carries it.
+const SECRET = "5ec2e7".repeat(10);
+
+function startServer(port, { secret = SECRET } = {}) {
   const child = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, BASANITE_MCP_PORT: String(port), BASANITE_EXTENSION_ID: EXTENSION_ID },
+    env: { ...process.env, BASANITE_MCP_PORT: String(port), BASANITE_EXTENSION_ID: EXTENSION_ID, ...(secret ? { BASANITE_SECRET: secret } : {}) },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stderr = "";
@@ -87,7 +90,7 @@ async function bootExtension(port) {
     tableId: PEOPLE, tableName: "People", fields: people.fields, mapping: fieldsLib.suggestMapping(people.fields),
     linked: linkedLib.suggestLinked(BASANITE_TABLES, PEOPLE), baseTables: sink.summarizeTables(BASANITE_TABLES), schemaAt: Date.now(), stampValue: "Added By Branch" };
   const cookies = { get: async ({ name }) => ({ value: name === "JSESSIONID" ? '"ajax:1234"' : `${name}-value` }) };
-  const worker = await bootWorker({ fetch, cookies, storage: { airtable_config: config, claude_bridge_enabled: true, claude_bridge_port: port } });
+  const worker = await bootWorker({ fetch, cookies, storage: { airtable_config: config, claude_bridge_enabled: true, claude_bridge_port: port, claude_bridge_secret: SECRET } });
   return { base, worker };
 }
 
@@ -197,6 +200,93 @@ test("two Claude sessions at once: the second server takes the next port and bot
   }
 });
 
+test("the server answers only its own extension's check, and survives junk on either side", async () => {
+  const port = await freePort();
+  const server = startServer(port);
+  try {
+    await server.listening;
+    const check = (query) => realFetch(`http://127.0.0.1:${port}/${query}`).then((response) => response.status, () => "no answer");
+    assert.equal(await check(`?ext=${EXTENSION_ID}`), 204);
+    assert.equal(await check(""), 204, "an older extension's check, without its id");
+    // Another extension would dial, be refused, and Chrome logs that refusal: it gets no answer at all.
+    assert.equal(await check("?ext=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "no answer");
+    // JSON that isn't a request object, from Claude.
+    const invalid = await server.rpc("tools/list").then(() => new Promise((resolve, reject) => {
+      setTimeout(() => reject(new Error(`no answer to a null request; server exit ${server.child.exitCode}`)), 3000);
+      createInterface({ input: server.child.stdout }).once("line", (line) => resolve(JSON.parse(line)));
+      server.child.stdin.write("null\n");
+    }));
+    assert.equal(invalid.error?.code, -32600);
+    // …and a null frame from an extension connection.
+    const ws = new (withOrigin(`chrome-extension://${EXTENSION_ID}`))(`ws://127.0.0.1:${port}`);
+    await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+    ws.send("null");
+    ws.send("[1,2]");
+    await sleep(200);
+    assert.equal(server.child.exitCode, null, `the server died: ${server.stderr()}`);
+    const { result } = await server.rpc("tools/list");
+    assert.ok(result.tools.length > 0, "still answering");
+    ws.close();
+  } finally {
+    server.child.kill();
+  }
+});
+
+test("a second browser can't take the connection from one that still answers", async () => {
+  const port = await freePort();
+  const server = startServer(port);
+  const Ext = withOrigin(`chrome-extension://${EXTENSION_ID}`);
+  const answering = (ws, who) => { ws.onmessage = (event) => { const m = JSON.parse(event.data); if (m.id != null) ws.send(JSON.stringify({ id: m.id, result: { who } })); }; };
+  let first;
+  let second;
+  try {
+    await server.listening;
+    first = new Ext(`ws://127.0.0.1:${port}`);
+    await new Promise((resolve) => { first.onopen = resolve; });
+    answering(first, "first");
+    assert.equal((await server.call("status")).value.who, "first");
+    second = new Ext(`ws://127.0.0.1:${port}`);
+    answering(second, "second");
+    const closed = await new Promise((resolve) => { second.onclose = (event) => resolve(event.code); });
+    assert.equal(closed, 4000, "the newcomer is closed cleanly");
+    assert.equal((await server.call("status")).value.who, "first", "the first keeps the connection");
+    assert.match(server.stderr(), /keeping the one already connected/);
+  } finally {
+    first?.close();
+    second?.close();
+    server.child.kill();
+  }
+});
+
+test("the extension answers nothing to a server that can't present this install's secret", async () => {
+  for (const secret of [null, "another-install".repeat(4)]) {
+    const port = await freePort();
+    const server = startServer(port, { secret });
+    globalThis.WebSocket = withOrigin(`chrome-extension://${EXTENSION_ID}`);
+    let worker;
+    try {
+      await server.listening;
+      ({ worker } = await bootExtension(port));
+      // No answer; after its 5s wait for the proof, the extension says why and closes.
+      const status = await Promise.race([server.call("status"), sleep(8_000).then(() => ({ isError: true, value: "no answer" }))]);
+      assert.equal(status.isError, true, `answered a server with secret ${secret}`);
+      assert.match(status.value, /press Re-download/, `Claude is told what to do (secret ${secret}): ${status.value}`);
+      for (let i = 0; i < 100 && !worker.store.get("claude_bridge_state")?.outdated; i++) await sleep(20);
+      // The panel says to re-download, instead of waiting forever.
+      assert.deepEqual([worker.store.get("claude_bridge_state")?.connected, worker.store.get("claude_bridge_state")?.outdated], [false, true]);
+    } finally {
+      server.child.kill();
+      if (worker) {
+        const changed = { claude_bridge_enabled: { newValue: false } };
+        for (const [name, [listener]] of worker.calls) if (name === "storageChanged") listener(changed, "local");
+        await sleep(100);
+      }
+      globalThis.WebSocket = NodeWebSocket;
+      worker?.restore();
+    }
+  }
+});
+
 test("the server refuses any origin but the extension's", async () => {
   const port = await freePort();
   const server = startServer(port);
@@ -228,7 +318,7 @@ test("the extension answers only its allowed list", async () => {
   }
 });
 
-test("a call in flight on a replaced connection fails at once instead of hanging", async () => {
+test("a connection that stopped answering is replaced, and its call in flight fails at once instead of hanging", async () => {
   const port = await freePort();
   const server = startServer(port);
   const Ext = withOrigin(`chrome-extension://${EXTENSION_ID}`);
@@ -249,7 +339,8 @@ test("a call in flight on a replaced connection fails at once instead of hanging
     const result = await call;
     assert.equal(result.isError, true);
     assert.match(result.value, /disconnected mid-call/);
-    assert.ok(Date.now() - started < 2_000);
+    // The server first gives the current connection 1.5s to answer.
+    assert.ok(Date.now() - started < 3_000);
   } finally {
     first?.close();
     second?.close();

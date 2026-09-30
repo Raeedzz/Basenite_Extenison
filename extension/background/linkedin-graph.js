@@ -1367,19 +1367,30 @@ const engine = (function () {
 
     const people = [];
     const seen = new Set();
-    let offset = Math.max(0, Math.floor(start) || 0);
+    let offset = Math.min(MAX_FILTERED_RESULTS, Math.max(0, Math.floor(start) || 0));
     let total = 0;
-    let exhausted = false;
-    while (people.length < wanted && !stopped()) {
-      const data = await searchApiFetch((deco) =>
-        `/voyager/api/search/dash/clusters` +
-        `?decorationId=${encodeURIComponent(deco)}` +
-        `&origin=${faceted ? "FACETED_SEARCH" : "GLOBAL_SEARCH_HEADER"}&q=all` +
-        `&query=(${keywordClause}flagshipSearchIntent:SEARCH_SRP,queryParameters:(${queryParameters}))` +
-        // Only as many as still wanted: a page cut short would move the offset
-        // past people nobody got.
-        `&start=${offset}&count=${Math.min(PER_PAGE, wanted - people.length)}`
-      );
+    let exhausted = offset >= MAX_FILTERED_RESULTS;
+    let failure = null;
+    while (!exhausted && people.length < wanted && !stopped()) {
+      let data;
+      try {
+        data = await searchApiFetch((deco) =>
+          `/voyager/api/search/dash/clusters` +
+          `?decorationId=${encodeURIComponent(deco)}` +
+          `&origin=${faceted ? "FACETED_SEARCH" : "GLOBAL_SEARCH_HEADER"}&q=all` +
+          `&query=(${keywordClause}flagshipSearchIntent:SEARCH_SRP,queryParameters:(${queryParameters}))` +
+          // Only as many as still wanted (a page cut short would move the offset
+          // past people nobody got), and never past LinkedIn's 1,000.
+          `&start=${offset}&count=${Math.min(PER_PAGE, wanted - people.length, MAX_FILTERED_RESULTS - offset)}`
+        );
+      } catch (error) {
+        // A later page failing (rate limit, timeout) keeps the people already
+        // found; nextStart says where to pick up.
+        if (people.length === 0) throw error;
+        failure = error?.message || String(error);
+        LOG(`People search stopped at ${offset}: ${failure}`);
+        break;
+      }
       total = data?.metadata?.totalResultCount || total;
       const slots = searchResultKeys(data, offset);
       for (const person of parseSearchPeople(data)) {
@@ -1395,6 +1406,7 @@ const engine = (function () {
       people,
       total,
       nextStart: exhausted ? null : offset,
+      ...(failure ? { stoppedEarly: failure } : {}),
       // What the names resolved to, so a wrong match is visible.
       ...(of ? { connectionsOf: [of.firstName, of.lastName].filter(Boolean).join(" ") } : {}),
       ...(resolved.currentCompany ? { companies: resolved.currentCompany } : {}),
@@ -1464,7 +1476,8 @@ const engine = (function () {
       // Fall through to keyword search on the de-slugged name.
       companyName = slug.replace(/-/g, " ");
     }
-    const kw = encodeURIComponent(companyName.trim());
+    // dslValue: a paren in "King's College (London)" would close the query early.
+    const kw = dslValue(companyName.trim());
     const data = await searchApiFetch((deco) =>
       `/voyager/api/search/dash/clusters` +
       `?decorationId=${encodeURIComponent(deco)}` +
