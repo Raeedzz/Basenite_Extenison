@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 /**
  * MCP server (stdio) that drives the Basanite Chrome extension.
- * The extension dials ws://127.0.0.1:PORT once "Claude control" is on in its panel;
+ * The extension dials ws://127.0.0.1:<port> once "Claude control" is on in its panel;
  * only that extension's origin is accepted. No dependencies.
  *
  * The panel's "Connect Claude" button downloads it as a Claude desktop connector
  * (lib/claude-connector.js). By hand: node mcp/basanite-mcp.mjs
+ *
+ * Every Claude session (chat, task, Claude Code window) runs its own copy. Each
+ * takes the first free port from BASANITE_MCP_PORT up, and the extension dials
+ * them all, so up to PORT_RANGE sessions use it at once.
  *
  * Env: BASANITE_MCP_PORT (17891), BASANITE_EXTENSION_ID (the unpacked extension's id).
  */
@@ -13,10 +17,11 @@ import { createServer } from "node:http";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 
-const PORT = Number(process.env.BASANITE_MCP_PORT) || 17891;
+const BASE_PORT = Number(process.env.BASANITE_MCP_PORT) || 17891;
+const PORT_RANGE = 5; // the extension dials BASE_PORT … BASE_PORT + 4 (claude-bridge.js)
 const ORIGIN = `chrome-extension://${process.env.BASANITE_EXTENSION_ID || "cfpkjnakokdcflgklcgmkofjfkgehoia"}`;
 const CALL_TIMEOUT_MS = 300_000;
-const CONNECT_WAIT_MS = 35_000; // the extension redials every 30s
+const CONNECT_WAIT_MS = 45_000; // the extension redials every 30s, after a check of up to 3s
 const MAX_FRAME = 16 * 1024 * 1024;
 const log = (...args) => console.error("[basanite-mcp]", ...args);
 
@@ -279,7 +284,9 @@ function fromExtension(text) {
 
 async function waitForExtension() {
   if (extension) return;
-  if (portTaken) throw new Error(`Port ${PORT} is taken, probably by another Claude session's Basanite MCP server. Close that session, or set BASANITE_MCP_PORT here and "claude_bridge_port" in the extension.`);
+  if (portTaken) {
+    throw new Error(`Ports ${BASE_PORT}–${BASE_PORT + PORT_RANGE - 1} are all taken: ${PORT_RANGE} other Claude sessions have Basanite open. Close one of them (another chat, task, or Claude Code window), then try again.`);
+  }
   await new Promise((resolve) => {
     const done = () => { clearTimeout(timer); waiters.delete(done); resolve(); };
     const timer = setTimeout(done, CONNECT_WAIT_MS);
@@ -307,14 +314,19 @@ async function callExtension(message) {
 // not an error status, so the check itself logs nothing either.
 const http = createServer((req, res) => res.writeHead(204).end());
 http.on("upgrade", accept);
+// Another session's server on a port: take the next one.
+let offset = 0;
+const listen = () => http.listen(BASE_PORT + offset, "127.0.0.1");
 http.on("error", (error) => {
   if (error.code !== "EADDRINUSE") throw error;
+  if (++offset < PORT_RANGE) return listen();
+  offset = 0;
   portTaken = true;
-  log(`port ${PORT} in use, retrying in 5s`);
-  setTimeout(() => http.listen(PORT, "127.0.0.1"), 5_000).unref();
+  log(`ports ${BASE_PORT}–${BASE_PORT + PORT_RANGE - 1} all in use, retrying in 5s`);
+  setTimeout(listen, 5_000).unref();
 });
-http.on("listening", () => { portTaken = false; log(`listening on 127.0.0.1:${PORT} for ${ORIGIN}`); });
-http.listen(PORT, "127.0.0.1");
+http.on("listening", () => { portTaken = false; log(`listening on 127.0.0.1:${http.address().port} for ${ORIGIN}`); });
+listen();
 
 // ─── MCP over stdio ──────────────────────────────────────────────────────────
 

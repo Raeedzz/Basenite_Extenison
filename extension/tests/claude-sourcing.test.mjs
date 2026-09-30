@@ -290,9 +290,10 @@ test("with Claude control on and no server running, the extension never dials (a
     cookies,
   });
   try {
-    await until(() => probes.length >= 1, "the bridge to check for a server");
+    await until(() => probes.length >= 5, "the bridge to check every port for a server");
     await new Promise((r) => setTimeout(r, 200));
-    assert.deepEqual(probes, ["http://127.0.0.1:17899/"]);
+    // One server per Claude session, each on the next port up.
+    assert.deepEqual(probes.sort(), [17899, 17900, 17901, 17902, 17903].map((port) => `http://127.0.0.1:${port}/`));
     assert.deepEqual(dials, [], "no WebSocket while nothing listens");
   } finally {
     await worker.send({ type: "CANCEL_SYNC" }).catch(() => {});

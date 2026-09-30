@@ -19,6 +19,8 @@ const bridge = await import("../background/claude-bridge.js");
 
 const SERVER = fileURLToPath(new URL("../mcp/basanite-mcp.mjs", import.meta.url));
 const P_LINKEDIN = "fldvyrmtV2q06ip6k";
+// The bridge's "is a server up" checks go to the real servers these tests start.
+const realFetch = globalThis.fetch;
 const json = (body) => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const url = (i) => `https://www.linkedin.com/in/person-${i}`;
@@ -74,6 +76,7 @@ async function bootExtension(port) {
   const base = fakeBase({ baseId: BASE_ID, tables: structuredClone(BASANITE_TABLES).map((table) => ({ ...table, records: table.records || [] })) });
   const fetch = async (input, init = {}) => {
     const u = String(input);
+    if (u.startsWith("http://127.0.0.1:")) return realFetch(input, init);
     if (u.startsWith("https://api.airtable.com/") || u.startsWith("https://content.airtable.com/")) return base.handle(input, init);
     const id = new URL(u, "https://www.linkedin.com").searchParams.get("memberIdentity");
     if (id) return json({ elements: [profile(Number(id.split("-")[1]))] });
@@ -155,6 +158,39 @@ test("Claude lists the tools, reads status and config, and bulk-enriches through
       for (let i = 0; i < 100 && worker.store.get("claude_bridge_state")?.connected !== false; i++) await sleep(10);
       assert.equal(worker.store.get("claude_bridge_state")?.connected, false);
       await sleep(100); // the queued off finishes its alarm call under the shim
+    }
+    globalThis.WebSocket = NodeWebSocket;
+    worker?.restore();
+  }
+});
+
+test("two Claude sessions at once: the second server takes the next port and both reach the extension", async () => {
+  const port = await freePort();
+  const first = startServer(port);
+  const second = startServer(port);
+  globalThis.WebSocket = withOrigin(`chrome-extension://${EXTENSION_ID}`);
+  let worker;
+  try {
+    await Promise.all([first.listening, second.listening]);
+    assert.match(first.stderr() + second.stderr(), new RegExp(`listening on 127\\.0\\.0\\.1:${port + 1}`), "the second session moved up a port");
+    ({ worker } = await bootExtension(port));
+    const [a, b] = await Promise.all([first.call("status"), second.call("status")]);
+    assert.equal(a.isError, false, `first session: ${JSON.stringify(a.value)}`);
+    assert.equal(b.isError, false, `second session: ${JSON.stringify(b.value)}`);
+    // One session leaving doesn't cut the other off.
+    first.child.kill();
+    await sleep(200);
+    const still = await second.call("status");
+    assert.equal(still.isError, false, JSON.stringify(still.value));
+    assert.equal(worker.store.get("claude_bridge_state")?.connected, true);
+  } finally {
+    first.child.kill();
+    second.child.kill();
+    if (worker) {
+      const changed = { claude_bridge_enabled: { newValue: false } };
+      for (const [name, [listener]] of worker.calls) if (name === "storageChanged") listener(changed, "local");
+      for (let i = 0; i < 100 && worker.store.get("claude_bridge_state")?.connected !== false; i++) await sleep(10);
+      await sleep(100);
     }
     globalThis.WebSocket = NodeWebSocket;
     worker?.restore();

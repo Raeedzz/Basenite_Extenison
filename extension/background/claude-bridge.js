@@ -10,6 +10,9 @@ export const BRIDGE_ENABLED_KEY = "claude_bridge_enabled";
 export const BRIDGE_STATE_KEY = "claude_bridge_state";
 const BRIDGE_PORT_KEY = "claude_bridge_port";
 export const BRIDGE_DEFAULT_PORT = 17891;
+// Every Claude session runs its own MCP server, each on the first free port from
+// the base up (mcp/basanite-mcp.mjs); one socket per server.
+export const BRIDGE_PORT_RANGE = 5;
 const BRIDGE_ALARM = "claude-bridge";
 const PROGRESS_KEYS = ["capture_progress", "enrich_progress", "mutual_progress", "company_progress"];
 
@@ -35,7 +38,8 @@ export const BRIDGE_TYPES = new Set([
 
 let handle = null;
 let enabled = false;
-let socket = null;
+const sockets = new Map(); // port → WebSocket
+const dialing = new Set();
 // Toggles apply in order, so on-off-on can't finish with the off.
 let applying = Promise.resolve();
 
@@ -67,38 +71,47 @@ async function apply(on) {
     return connect();
   }
   await chrome.alarms.clear(BRIDGE_ALARM);
-  const open = socket;
-  socket = null;
-  open?.close();
+  const open = [...sockets.values()];
+  sockets.clear();
+  for (const ws of open) ws.close();
   await setState(false);
 }
 
 async function connect() {
-  if (!enabled || socket) return;
-  const port = Number((await chrome.storage.local.get(BRIDGE_PORT_KEY))[BRIDGE_PORT_KEY]) || BRIDGE_DEFAULT_PORT;
-  // A WebSocket that can't connect logs an error on chrome://extensions, every
-  // redial, while Claude isn't running; a fetch that can't connect logs nothing.
-  // So dial only once the server answers one.
-  if (!enabled || socket || !(await listening(port))) return;
-  if (!enabled || socket) return;
-  let ws;
+  if (!enabled) return;
+  const base = Number((await chrome.storage.local.get(BRIDGE_PORT_KEY))[BRIDGE_PORT_KEY]) || BRIDGE_DEFAULT_PORT;
+  await Promise.all(Array.from({ length: BRIDGE_PORT_RANGE }, (_, i) => dial(base + i)));
+}
+
+async function dial(port) {
+  if (!enabled || sockets.has(port) || dialing.has(port)) return;
+  dialing.add(port);
   try {
-    ws = new WebSocket(`ws://127.0.0.1:${port}`);
-  } catch {
-    return;
+    // A WebSocket that can't connect logs an error on chrome://extensions, every
+    // redial, while Claude isn't running; a fetch that can't connect logs nothing.
+    // So dial only once the server answers one.
+    if (!(await listening(port)) || !enabled || sockets.has(port)) return;
+    let ws;
+    try {
+      ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    } catch {
+      return;
+    }
+    sockets.set(port, ws);
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ hello: { version: chrome.runtime.getManifest().version } }));
+      void setState(true);
+    };
+    ws.onmessage = (event) => void answer(ws, event.data);
+    // A failed dial closes too; the alarm tries again.
+    ws.onclose = () => {
+      if (sockets.get(port) !== ws) return;
+      sockets.delete(port);
+      void setState([...sockets.values()].some((open) => open.readyState === WebSocket.OPEN));
+    };
+  } finally {
+    dialing.delete(port);
   }
-  socket = ws;
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ hello: { version: chrome.runtime.getManifest().version } }));
-    void setState(true);
-  };
-  ws.onmessage = (event) => void answer(ws, event.data);
-  // A failed dial closes too; the alarm tries again.
-  ws.onclose = () => {
-    if (socket !== ws) return;
-    socket = null;
-    void setState(false);
-  };
 }
 
 async function listening(port) {
