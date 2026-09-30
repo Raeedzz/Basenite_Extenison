@@ -95,6 +95,7 @@ import {
 } from "./linkedin-capture.js";
 import { setCompanyDetailsProvider, setLinkedProgressHook } from "../lib/airtable-linked-sync.js";
 import { readMutualPrefs } from "../lib/mutual-prefs.js";
+import { startClaudeBridge } from "./claude-bridge.js";
 import {
   cancelCompanyCapture,
   captureCompany,
@@ -744,6 +745,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true; // keep channel open for async response
 });
 
+// The local Claude MCP server, when the user has turned it on. It bypasses the
+// panel-only sender check; claude-bridge.js allows only its own list of types.
+void startClaudeBridge((message) => handleMessage(message).catch(serializeMessageError)).catch(() => {});
+
 function serializeMessageError(error) {
   if (error instanceof ApiError) {
     return { error: error.message, status: error.status, code: error.code, type: error.type || null };
@@ -786,9 +791,10 @@ async function handleMessage(message) {
 
     case "SET_SOFT_SYNC_PREFS": {
       const raw = message.prefs && typeof message.prefs === "object" ? message.prefs : {};
+      // A missing timesPerDay (Claude turning it on or off) keeps the current one.
       const prefs = await writeSoftSyncPrefs({
         enabled: raw.enabled === true,
-        timesPerDay: Number(raw.timesPerDay),
+        ...(raw.timesPerDay === undefined ? {} : { timesPerDay: Number(raw.timesPerDay) }),
       });
       return { ok: true, prefs };
     }

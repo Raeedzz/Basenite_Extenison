@@ -11,6 +11,7 @@ import {
 } from "../lib/progress-copy.js";
 import { MUTUAL_PREFS_KEY, normalizeMutualPrefs, readMutualPrefs } from "../lib/mutual-prefs.js";
 import { normalizeSoftSyncPrefs } from "../lib/soft-sync-prefs.js";
+import { buildConnector, CONNECTOR_FILE } from "../lib/claude-connector.js";
 
 const LOG = (...args) => console.log("[Panel]", ...args);
 const $ = (id) => document.getElementById(id);
@@ -1247,6 +1248,51 @@ async function saveSoftSync() {
 $("soft-enabled").addEventListener("change", saveSoftSync);
 $("soft-times").addEventListener("change", saveSoftSync);
 
+// ─── Claude control ──────────────────────────────────────────────────────────
+
+const CLAUDE_ENABLED_KEY = "claude_bridge_enabled";
+const CLAUDE_STATE_KEY = "claude_bridge_state";
+
+// Set once the connector is downloaded, so the waiting line says what to do next.
+let claudeDownloaded = false;
+
+async function renderClaudeControl() {
+  const stored = await chrome.storage.local.get([CLAUDE_ENABLED_KEY, CLAUDE_STATE_KEY]);
+  const on = stored[CLAUDE_ENABLED_KEY] === true;
+  const connected = on && stored[CLAUDE_STATE_KEY]?.connected === true;
+  $("claude-enabled").checked = on;
+  $("claude-setup-btn").textContent = connected ? "Re-download" : "Connect Claude";
+  $("claude-status").textContent = !on ? ""
+    : connected ? "Connected to Claude."
+      : claudeDownloaded ? `Downloaded ${CONNECTOR_FILE}. Double-click it in Downloads and press Install in Claude. This says Connected once it's in (up to 30s).`
+        : "Waiting for Claude. Not set up yet? Press Connect Claude.";
+}
+
+$("claude-setup-btn").addEventListener("click", async () => {
+  try {
+    const bytes = async (path) => new Uint8Array(await (await fetch(chrome.runtime.getURL(path))).arrayBuffer());
+    const { claude_bridge_port: port } = await chrome.storage.local.get("claude_bridge_port");
+    const file = buildConnector({
+      script: new TextDecoder().decode(await bytes("mcp/basanite-mcp.mjs")),
+      icon: await bytes("icons/icon-128.png"),
+      extensionId: chrome.runtime.id,
+      version: chrome.runtime.getManifest().version,
+      port: port || null,
+    });
+    const link = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(new Blob([file], { type: "application/zip" })), download: CONNECTOR_FILE,
+    });
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 60_000);
+  } catch (error) {
+    $("claude-status").textContent = `Couldn't build the Claude connector: ${error.message}`;
+    return;
+  }
+  claudeDownloaded = true;
+  await chrome.storage.local.set({ [CLAUDE_ENABLED_KEY]: true });
+  await renderClaudeControl();
+});
+
 // ─── Health ──────────────────────────────────────────────────────────────────
 
 async function checkHealth({ probe = false } = {}) {
@@ -1402,6 +1448,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
       if (!busy && !errorActive) renderIdle();
     });
   }
+  if (CLAUDE_ENABLED_KEY in changes || CLAUDE_STATE_KEY in changes) void renderClaudeControl();
   if (HEALTH_KEY in changes) {
     connectionHealth = changes[HEALTH_KEY].newValue || null;
     if (!busy && !errorActive) renderIdle();
@@ -1418,6 +1465,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   applyTheme(stored[THEME_KEY] || document.documentElement.dataset.theme);
   await readSyncHistory();
   await renderMutualPrefs();
+  await renderClaudeControl();
   await refreshConfig();
   renderView();
   await readActiveProfile();
