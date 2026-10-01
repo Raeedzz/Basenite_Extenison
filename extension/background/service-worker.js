@@ -28,7 +28,8 @@ import {
   whoami,
 } from "../lib/airtable-client.js";
 import {
-  canMap, isWritable, newFieldSpec, offerNewMappings, seenMappings, SOURCE_FIELD_BY_KEY, SOURCE_FIELDS, suggestMapping, suggestStampValue,
+  canMap, isWritable, linkedinKey, newFieldSpec, offerNewMappings, seenMappings, SOURCE_FIELD_BY_KEY, SOURCE_FIELDS, suggestMapping,
+  suggestStampValue,
 } from "../lib/airtable-fields.js";
 import {
   linkedReady,
@@ -40,6 +41,7 @@ import {
   suggestPeopleTable,
 } from "../lib/airtable-linked.js";
 import { interactionEntry, interactionTables, logInteraction } from "../lib/airtable-interactions.js";
+import { addToMandate, listMandates, mandatesReady, personMandates } from "../lib/airtable-mandates.js";
 import { parseSearchUrl } from "../lib/linkedin-search-url.js";
 import {
   clearConfig,
@@ -839,6 +841,18 @@ async function handleMessage(message) {
 
     case "LOG_INTERACTION":
       return handleLogInteraction(message);
+
+    case "PROFILE_PREVIEW":
+      return handleProfilePreview(message.url);
+
+    case "PERSON_MANDATES":
+      return handlePersonMandates(message.url);
+
+    case "LIST_MANDATES":
+      return handleListMandates();
+
+    case "ADD_TO_MANDATE":
+      return handleAddToMandate(message);
 
     case "BULK_ENRICH":
       return handleBulkEnrich(message.urls);
@@ -1844,6 +1858,139 @@ async function handleLogInteraction(message) {
   } catch (error) {
     ERR("Log interaction failed:", error?.message || error);
     return { error: error?.message || String(error), noteId: error?.noteId || noteId };
+  }
+}
+
+// ─── Open profile: preview and Add to mandate ────────────────────────────────
+
+// Profiles the preview already read, so Add writes them without asking LinkedIn again.
+const PREVIEW_TTL_MS = 10 * 60_000;
+const previewCache = new Map();
+
+function cachedProfile(url) {
+  const hit = previewCache.get(url);
+  if (hit && Date.now() - hit.at < PREVIEW_TTL_MS) return hit.profile;
+  previewCache.delete(url);
+  return null;
+}
+
+/** What the panel shows for the open profile. Skipped while a capture holds LinkedIn. */
+async function handleProfilePreview(rawUrl) {
+  const url = safeLinkedInProfileUrl(rawUrl);
+  if (!url) return { error: "Open a LinkedIn profile first." };
+  let profile = cachedProfile(url);
+  if (!profile) {
+    if (linkedInBusy()) return { profile: null, busy: true };
+    const enriched = await handleEnrichLinkedInProfiles([url]);
+    if (enriched.error) return { error: enriched.error };
+    profile = enriched.profiles[0] || null;
+    if (!profile) return { error: "LinkedIn won't show that profile." };
+    previewCache.set(url, { profile, at: Date.now() });
+    if (previewCache.size > 30) previewCache.delete(previewCache.keys().next().value);
+  }
+  const current = (profile.experience || []).find((job) => job.isCurrent) || null;
+  return {
+    profile: {
+      linkedinUrl: profile.linkedinUrl,
+      name: profile.name,
+      headline: profile.headline || null,
+      photoUrl: profile.photoUrl || null,
+      location: profile.location || null,
+      degree: profile.connectionDegree || null,
+      title: current?.title || null,
+      company: current?.company || null,
+    },
+  };
+}
+
+/** Their People row and the mandates it's linked to; nulls when they aren't in People. */
+async function handlePersonMandates(rawUrl) {
+  const url = safeLinkedInProfileUrl(rawUrl);
+  if (!url) return { error: "Open a LinkedIn profile first." };
+  const config = await readConfig();
+  const problem = configProblem(config);
+  if (problem) return { error: problem };
+  const person = await findOpenPerson(url, cachedProfile(url));
+  if (!person) return { person: null, mandates: null };
+  const mandates = mandatesReady(config.baseTables, config.tableId) ? await personMandates(config, person.id) : null;
+  return { person, mandates };
+}
+
+async function handleListMandates() {
+  const config = await readConfig();
+  const problem = configProblem(config);
+  if (problem) return { error: problem };
+  if (!mandatesReady(config.baseTables, config.tableId)) return { ready: false, mandates: [] };
+  return { ready: true, mandates: await listMandates(config) };
+}
+
+/**
+ * Their People row under the tab's URL, under the one LinkedIn now gives them
+ * (a changed vanity URL), or by member id: any is them, never a reason to add a row.
+ */
+async function findOpenPerson(url, profile) {
+  const keys = new Map([url, profile?.linkedinUrl].filter(Boolean).map((each) => [linkedinKey(each), each]));
+  for (const each of keys.values()) {
+    const person = await findPersonRecord(each);
+    if (person) return person;
+  }
+  // A row synced under a URL they've since changed, found by LinkedIn's member id.
+  return profile?.memberId ? findPersonRecord(profile.linkedinUrl || url, { memberId: profile.memberId }) : null;
+}
+
+// One Add at a time: a second for the same person finds the row the first made.
+let addQueue = Promise.resolve();
+
+function handleAddToMandate(message) {
+  const run = addQueue.then(() => addOpenProfile(message));
+  addQueue = run.catch(() => {});
+  return run;
+}
+
+/**
+ * Someone already in People is only linked, their row left as it is; someone
+ * who isn't is added first (from the preview when there is one). With a
+ * mandate picked, they're then linked into it unless they already are.
+ */
+async function addOpenProfile(message) {
+  const url = safeLinkedInProfileUrl(message.url);
+  if (!url) return { error: "Open a LinkedIn profile first." };
+  const mandateId = typeof message.mandateId === "string" && /^rec[A-Za-z0-9]{14}$/.test(message.mandateId) ? message.mandateId : null;
+  const config = await readConfig();
+  const problem = configProblem(config);
+  if (problem) return { error: problem };
+  if (mandateId && !mandatesReady(config.baseTables, config.tableId)) {
+    return { error: "This base has no Mandates table linked to People. Reload columns in Settings." };
+  }
+  try {
+    const profile = cachedProfile(url);
+    let person = await findOpenPerson(url, profile);
+    let created = false;
+    let warning = null;
+    if (!person) {
+      let written = profile;
+      if (profile) {
+        const tally = await captureProfiles([profile]);
+        if (tally.failed && !tally.created && !tally.updated && !tally.unchanged) return { error: tally.errors[0] || "Couldn't add them to People." };
+        created = tally.created > 0;
+        warning = tally.errors[0] || null;
+      } else {
+        if (linkedInBusy()) return { error: "They aren't in People yet, and a capture is running. Try again when it's done." };
+        const added = await handleCaptureProfiles([url]);
+        if (added.error) return { error: added.error };
+        created = added.created > 0;
+        warning = added.warning;
+        written = added.profiles?.[0] || null;
+      }
+      person = await findOpenPerson(url, written);
+      if (!person) return { error: warning || "Couldn't add them to People." };
+    }
+    if (!mandateId) return { ok: true, person, created, warning };
+    const linked = await addToMandate(config, { personId: person.id, mandateId, reachedOut: message.reachedOut === true });
+    return { ok: true, person, created, ...linked, warning: linked.warning || warning };
+  } catch (error) {
+    ERR("Add to mandate failed:", error?.message || error);
+    return { error: error?.message || String(error) };
   }
 }
 

@@ -112,6 +112,9 @@ function closeSettings() {
   reviewing = false;
   renderView();
   if (!busy && !errorActive) renderIdle();
+  // Setup or a schema reload may have changed the base: ask again.
+  void loadMandates({ force: true });
+  if (activeProfileUrl && ready()) void loadInPeople(activeProfileUrl);
 }
 
 $("back-btn").addEventListener("click", closeSettings);
@@ -824,7 +827,7 @@ $("open-linkedin-btn").addEventListener("click", () => {
 // ─── Capture ─────────────────────────────────────────────────────────────────
 
 const captureButtons = [
-  "sync-btn", "soft-sync-btn", "test-sync-btn", "profile-add-btn", "profile-mutuals-btn",
+  "sync-btn", "soft-sync-btn", "test-sync-btn", "profile-mutuals-btn",
   "company-btn", "search-btn", "search-add-btn", "search-all-btn", "search-mutuals-btn", "mutuals-btn",
 ].map($);
 
@@ -833,6 +836,7 @@ function setCaptureEnabled() {
   renderBulkCount();
   renderEnrichTable();
   renderInteraction();
+  renderAdd();
 }
 
 async function start(line, type, payload, retry) {
@@ -924,30 +928,260 @@ function parseUrls(text) {
   return [...new Set(String(text || "").split(/[\s,;]+/).map((value) => canonicalLinkedinUrl(value)).filter(Boolean))];
 }
 
+// ─── Open profile ────────────────────────────────────────────────────────────
+
+const MANDATE_PICK_KEY = "basanite_mandate_pick";
+
 let activeProfileUrl = null;
+// The name the tab title gives, until LinkedIn's answer lands.
+let tabName = "";
+// LinkedIn's answer for the open profile: loading | ready | skipped | failed.
+let preview = null;
+let previewState = "loading";
+let previewTimer = null;
+// Airtable's answer: undefined while asking, { person: null } when they aren't in People.
+let inPeople;
+let mandates = [];
+let mandatesOn = false;
+let mandatesAt = 0;
+let mandatePick = { mandateId: "", reachedOut: false };
+let adding = false;
+let profileStatusTimer = null;
+
+function nameFromTitle(title) {
+  return String(title || "").replace(/^\(\d+\)\s*/, "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
+}
 
 async function readActiveProfile() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
   const previous = activeProfileUrl;
   activeProfileUrl = linkedinProfileUrl(tab?.url || "");
   $("profile-card").classList.toggle("hidden", !activeProfileUrl);
-  if (activeProfileUrl) {
-    const name = String(tab.title || "").replace(/^\(\d+\)\s*/, "").replace(/\s*\|\s*LinkedIn\s*$/i, "").trim();
-    $("profile-name").textContent = name || activeProfileUrl;
+  // One main action at a time: on a profile that's Add, not Sync.
+  $("sync-btn").classList.toggle("primary", !activeProfileUrl);
+  const title = nameFromTitle(tab?.title);
+  // LinkedIn retitles the tab after it loads; "LinkedIn" alone isn't a name.
+  if (activeProfileUrl && title && !/^linkedin$/i.test(title)) tabName = title;
+  if (activeProfileUrl !== previous) {
+    if (!title || /^linkedin$/i.test(title)) tabName = "";
+    preview = null;
+    previewState = "loading";
+    inPeople = undefined;
+    profileStatus("");
+    clearTimeout(previewTimer);
+    if (activeProfileUrl) {
+      const url = activeProfileUrl;
+      // Clicking through profiles fast asks LinkedIn only about the one that stays open.
+      previewTimer = setTimeout(() => void loadPreview(url), 350);
+      if (ready()) void loadInPeople(url);
+    }
+    if (!logging) resetInteraction();
   }
-  if (activeProfileUrl !== previous && !logging) resetInteraction();
+  renderProfile();
   renderInteraction();
+}
+
+async function loadPreview(url) {
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({ type: "PROFILE_PREVIEW", url });
+  } catch (error) {
+    response = { error: error.message };
+  }
+  if (url !== activeProfileUrl) return;
+  preview = response?.profile || null;
+  previewState = preview ? "ready" : response?.busy ? "skipped" : "failed";
+  renderProfile();
+}
+
+async function loadInPeople(url) {
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({ type: "PERSON_MANDATES", url });
+  } catch (error) {
+    response = { error: error.message };
+  }
+  if (url !== activeProfileUrl || adding) return;
+  inPeople = response?.error ? null : { person: response.person, mandates: response.mandates };
+  renderProfile();
+}
+
+async function loadMandates({ force = false } = {}) {
+  if (!ready() || (!force && Date.now() - mandatesAt < 15_000)) return;
+  mandatesAt = Date.now();
+  try {
+    const response = await send("LIST_MANDATES");
+    mandatesOn = response.ready === true;
+    mandates = response.mandates || [];
+  } catch (error) {
+    LOG("Mandates not read:", error.message);
+    mandatesAt = 0;
+  }
+  renderMandates();
+}
+
+function renderMandates() {
+  const select = $("mandate-select");
+  const known = mandates.some((mandate) => mandate.id === mandatePick.mandateId);
+  select.replaceChildren(
+    option("", "No mandate, just People", { selected: !known }),
+    ...mandates.map((mandate) => option(mandate.id, mandate.status === "On hold" ? `${mandate.name} (on hold)` : mandate.name,
+      { selected: mandate.id === mandatePick.mandateId })),
+  );
+  $("mandate-pick").classList.toggle("hidden", !mandatesOn);
+  renderProfile();
+}
+
+function selectedMandate() {
+  return mandatesOn ? mandates.find((mandate) => mandate.id === mandatePick.mandateId) || null : null;
+}
+
+function initials(name) {
+  return String(name || "").split(/\s+/).filter(Boolean).slice(0, 2).map((word) => word[0].toUpperCase()).join("");
+}
+
+function renderProfile() {
+  if (!activeProfileUrl) return;
+  const name = preview?.name || tabName || activeProfileUrl.replace(/^.*\/in\//, "");
+  $("profile-card").classList.toggle("loading", previewState === "loading");
+  $("profile-name").textContent = name;
+  $("profile-initials").textContent = initials(name);
+  $("profile-degree").textContent = preview?.degree || "";
+  $("profile-headline").textContent = preview?.headline || "";
+  $("profile-meta").textContent = [preview?.company, preview?.location].filter(Boolean).join(" · ");
+  const photo = $("profile-photo");
+  const src = preview?.photoUrl || "";
+  if (photo.getAttribute("src") !== src) {
+    photo.classList.remove("loaded");
+    photo.hidden = !src;
+    if (src) photo.src = src;
+    else photo.removeAttribute("src");
+  }
+  renderTags();
+  renderAdd();
+}
+
+$("profile-photo").addEventListener("load", (event) => event.target.classList.add("loaded"));
+$("profile-photo").addEventListener("error", (event) => { event.target.hidden = true; });
+
+function renderTags() {
+  const list = $("profile-in");
+  const tag = (text, green = false) => {
+    const item = document.createElement("li");
+    item.className = green ? "tag green" : "tag";
+    item.textContent = text;
+    item.title = text;
+    return item;
+  };
+  const tags = [];
+  if (inPeople?.person) {
+    tags.push(tag("In People"));
+    const links = inPeople.mandates;
+    for (const mandate of links ? mandates : []) {
+      if (links.reachedOut.includes(mandate.id)) tags.push(tag(`${mandate.name} · reached out`, true));
+      else if (links.candidate.includes(mandate.id)) tags.push(tag(mandate.name, true));
+    }
+  }
+  list.replaceChildren(...tags);
+}
+
+function renderAdd() {
+  const button = $("profile-add-btn");
+  const mandate = selectedMandate();
+  const links = inPeople?.mandates;
+  let label;
+  let done = false;
+  if (adding) label = "Adding…";
+  else if (!mandate) {
+    label = inPeople?.person ? "In People" : "Add to People";
+    done = Boolean(inPeople?.person);
+  }
+  else if (links?.candidate.includes(mandate.id) && (!mandatePick.reachedOut || links.reachedOut.includes(mandate.id))) {
+    label = links.reachedOut.includes(mandate.id) ? "Reached out" : "In this mandate";
+    done = true;
+  } else if (links?.candidate.includes(mandate.id)) label = "Mark reached out";
+  else label = mandatePick.reachedOut ? "Add as reached out" : "Add to mandate";
+  button.disabled = !ready() || adding || done || !activeProfileUrl;
+  button.classList.toggle("done", done);
+  button.title = mandate ? mandate.name : "";
+  $("profile-add-label").textContent = done ? `✓ ${label}` : label;
+  $("mandate-select").disabled = adding;
+  $("mandate-reached").disabled = adding || !mandate;
+  $("mandate-reached").setAttribute("aria-pressed", String(mandatePick.reachedOut));
+}
+
+function profileStatus(text, kind = "") {
+  clearTimeout(profileStatusTimer);
+  const status = $("profile-status");
+  status.textContent = text;
+  status.classList.toggle("error", kind === "error");
+  status.classList.toggle("done", kind === "done");
+  if (kind === "done") profileStatusTimer = setTimeout(() => profileStatus(""), 4000);
+}
+
+async function addOpenProfile() {
+  if (!activeProfileUrl || adding || !ready()) return;
+  const url = activeProfileUrl;
+  const mandate = selectedMandate();
+  adding = true;
+  profileStatus("");
+  renderAdd();
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({
+      type: "ADD_TO_MANDATE",
+      url,
+      mandateId: mandate?.id || null,
+      reachedOut: Boolean(mandate) && mandatePick.reachedOut,
+    });
+  } catch (error) {
+    response = { error: error.message };
+  }
+  adding = false;
+  if (url === activeProfileUrl) {
+    if (response?.ok) {
+      const links = response.candidate ? { candidate: response.candidate, reachedOut: response.reachedOut, status: response.status } : inPeople?.mandates;
+      inPeople = { person: response.person, mandates: links || null };
+      const said = mandate
+        ? response.added ? `Added to ${mandate.name}` : `Already in ${mandate.name}`
+        : response.created ? "Added to People" : "Already in People";
+      profileStatus(response.warning ? `${said}. ${plainError(response.warning)}` : said, response.warning ? "error" : "done");
+      if (!links) void loadInPeople(url);
+    } else {
+      profileStatus(plainError(response?.error || "Couldn't add them."), "error");
+    }
+  }
+  renderProfile();
+}
+
+$("profile-add-btn").addEventListener("click", () => void addOpenProfile());
+
+$("mandate-select").addEventListener("focus", () => void loadMandates());
+$("mandate-select").addEventListener("change", (event) => {
+  mandatePick = { ...mandatePick, mandateId: event.target.value };
+  chrome.storage.local.set({ [MANDATE_PICK_KEY]: mandatePick }).catch(() => {});
+  profileStatus("");
+  renderAdd();
+});
+$("mandate-reached").addEventListener("click", () => {
+  mandatePick = { ...mandatePick, reachedOut: !mandatePick.reachedOut };
+  chrome.storage.local.set({ [MANDATE_PICK_KEY]: mandatePick }).catch(() => {});
+  renderAdd();
+});
+
+async function readMandatePick() {
+  const stored = await chrome.storage.local.get(MANDATE_PICK_KEY).catch(() => ({}));
+  const pick = stored[MANDATE_PICK_KEY] || {};
+  mandatePick = { mandateId: typeof pick.mandateId === "string" ? pick.mandateId : "", reachedOut: pick.reachedOut === true };
+  $("mandate-reached").setAttribute("aria-pressed", String(mandatePick.reachedOut));
 }
 
 chrome.tabs.onActivated.addListener(() => void readActiveProfile());
 chrome.tabs.onUpdated.addListener((_id, info, tab) => {
-  if (info.url || info.status === "complete") void readActiveProfile();
+  if (info.url || info.title || info.status === "complete") void readActiveProfile();
   if (info.status === "complete" && tab?.url?.includes("linkedin.com")) void checkHealth({ probe: true });
 });
 
-$("profile-add-btn").addEventListener("click", () => {
-  if (activeProfileUrl) void captureProfiles([activeProfileUrl]);
-});
 $("profile-mutuals-btn").addEventListener("click", () => {
   if (activeProfileUrl) startMutuals([activeProfileUrl]);
 });
@@ -1500,7 +1734,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   await renderClaudeControl();
   await refreshConfig();
   renderView();
+  await readMandatePick();
   await readActiveProfile();
+  void loadMandates({ force: true });
   // A live run shows at once, not after the LinkedIn probe.
   await pollProgress();
   await checkHealth({ probe: true });

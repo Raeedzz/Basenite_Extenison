@@ -158,6 +158,49 @@
       </div>
     </section>
 
+    <section id="profile-card" class="profile hidden" aria-label="Open profile">
+      <div class="profile-head">
+        <div class="avatar" aria-hidden="true">
+          <span id="profile-initials"></span>
+          <img id="profile-photo" alt="" referrerpolicy="no-referrer" hidden />
+        </div>
+        <div class="profile-text">
+          <div class="profile-title">
+            <span id="profile-name" class="profile-name"></span>
+            <span id="profile-degree" class="degree"></span>
+          </div>
+          <span id="profile-headline" class="profile-headline"></span>
+          <span id="profile-meta" class="profile-meta"></span>
+        </div>
+      </div>
+      <ul id="profile-in" class="tags" aria-label="Already in"></ul>
+      <div id="mandate-pick" class="mandate-pick hidden">
+        <select id="mandate-select" aria-label="Mandate"></select>
+        <button id="mandate-reached" class="chip" type="button" aria-pressed="false" title="Also adds them to the mandate's Reached out">Reached out</button>
+      </div>
+      <button id="profile-add-btn" class="btn primary block add-btn" type="button"><span id="profile-add-label">Add</span></button>
+      <p id="profile-status" class="note profile-status" role="status" aria-live="polite"></p>
+      <div class="profile-actions">
+        <button id="profile-mutuals-btn" class="btn sm ghost" type="button">Mutuals</button>
+        <button id="interaction-toggle" class="btn sm ghost hidden" type="button" aria-expanded="false" aria-controls="interaction-form">Log interaction</button>
+      </div>
+      <form id="interaction-form" class="interaction hidden" novalidate>
+        <div id="interaction-types" class="chips" role="group" aria-label="Interaction types"></div>
+        <label class="field">
+          <span class="eyebrow">When</span>
+          <input id="interaction-when" type="datetime-local" step="60" required />
+        </label>
+        <label class="field">
+          <span class="eyebrow">Note</span>
+          <textarea id="interaction-note" rows="2" placeholder="Optional"></textarea>
+        </label>
+        <div class="interaction-foot">
+          <p id="interaction-status" class="note" role="status" aria-live="polite"></p>
+          <button id="interaction-log-btn" class="btn sm primary" type="submit" disabled>Log</button>
+        </div>
+      </form>
+    </section>
+
     <section class="group">
       <button id="sync-btn" class="btn primary block" type="button">Sync LinkedIn network</button>
       <div class="pair">
@@ -183,31 +226,6 @@
         <input id="claude-enabled" class="switch" type="checkbox" role="switch" />
       </div>
       <p id="claude-status" class="note"></p>
-    </section>
-
-    <section id="profile-card" class="profile hidden">
-      <div class="profile-text">
-        <span class="eyebrow">Open profile</span>
-        <span id="profile-name" class="profile-name"></span>
-      </div>
-      <button id="profile-add-btn" class="btn sm" type="button">Add</button>
-      <button id="profile-mutuals-btn" class="btn sm ghost" type="button">Mutuals</button>
-      <button id="interaction-toggle" class="btn sm ghost hidden" type="button" aria-expanded="false" aria-controls="interaction-form">Log interaction</button>
-      <form id="interaction-form" class="interaction hidden" novalidate>
-        <div id="interaction-types" class="chips" role="group" aria-label="Interaction types"></div>
-        <label class="field">
-          <span class="eyebrow">When</span>
-          <input id="interaction-when" type="datetime-local" step="60" required />
-        </label>
-        <label class="field">
-          <span class="eyebrow">Note</span>
-          <textarea id="interaction-note" rows="2" placeholder="Optional"></textarea>
-        </label>
-        <div class="interaction-foot">
-          <p id="interaction-status" class="note" role="status" aria-live="polite"></p>
-          <button id="interaction-log-btn" class="btn sm primary" type="submit" disabled>Log</button>
-        </div>
-      </form>
     </section>
 
     <section class="list">

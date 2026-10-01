@@ -1077,9 +1077,10 @@ export function peopleRecordIds(urls) {
 
 /**
  * This person's People row, asked of Airtable itself (a teammate's row counts,
- * a deleted one doesn't): { id, name } or null. Read-only.
+ * a deleted one doesn't): { id, name } or null. With `memberId`, a row this
+ * extension wrote for them under an older profile URL counts too. Read-only.
  */
-export function findPersonRecord(linkedinUrl) {
+export function findPersonRecord(linkedinUrl, { memberId = null } = {}) {
   return queue(async () => {
     const config = await requireConfig();
     const key = linkedinKey(canonicalLinkedinUrl(linkedinUrl) || "");
@@ -1087,13 +1088,18 @@ export function findPersonRecord(linkedinUrl) {
     await loadState(config);
     const keyField = config.mapping.linkedinUrl;
     const nameField = config.mapping.name || null;
+    const fieldIds = [keyField, nameField].filter(Boolean);
     const records = await listRecords(config.token, config.baseId, config.tableId, {
-      fieldIds: [keyField, nameField].filter(Boolean),
+      fieldIds,
       formula: peopleFormula(keyField, [key]),
     });
     const matches = records.filter((record) => linkedinKey(record.fields?.[keyField]) === key);
     const known = state.rows.get(key)?.r;
-    const record = matches.find((match) => match.id === known) || matches[0];
+    let record = matches.find((match) => match.id === known) || matches[0];
+    const movedFrom = !record && memberId ? memberIndex().get(memberId) : null;
+    if (movedFrom && state.rows.get(movedFrom)?.r) {
+      [record] = await getRecordsByIds(config.token, config.baseId, config.tableId, [state.rows.get(movedFrom).r], { fieldIds });
+    }
     if (!record) return null;
     const name = nameField ? record.fields?.[nameField] : null;
     return { id: record.id, name: typeof name === "string" && name.trim() ? name.trim() : null };
