@@ -165,7 +165,7 @@ function mappedCount() {
 function renderSetup() {
   const connected = Boolean(config?.connected);
   const hasTable = connected && Boolean(config.tableId);
-  const syncingAs = config?.syncAsEmail || config?.userEmail || config?.userId || config?.tokenHint || "";
+  const syncingAs = config?.syncAsEmail || config?.linkedinName || config?.userEmail || config?.userId || config?.tokenHint || "";
   setStep("step-token", connected ? "done" : "active",
     config?.knownByBlocked ? "Known by is off" : syncingAs ? `Syncing as ${syncingAs}` : "");
   $("knownby-note").classList.toggle("hidden", !config?.knownByBlocked);
@@ -503,14 +503,17 @@ $("token-form").addEventListener("submit", (event) => {
   const token = $("token-input").value.trim();
   if (!token) return;
   void run($("token-btn"), async () => {
-    setNote("Connecting…");
+    setNote("Connecting and setting up your table…");
     tablesByBase = new Map();
     suggestedByBase = new Map();
     delete tableSelect.dataset.base;
     adopt(await send("AIRTABLE_CONNECT", { token }));
     $("token-input").value = "";
     $("step-token").classList.remove("open");
-    setNote("");
+    setNote(!config.tableId ? ""
+      : config.columnsError
+        ? `Set up ${config.tableName} with ${mappedCount()} fields. Couldn't create the rest: ${config.columnsError} Press Create missing to try again.`
+        : `Ready: ${mappedCount()} fields go into ${config.baseName} › ${config.tableName}. Change anything under Columns.`, Boolean(config.columnsError));
   });
 });
 
@@ -528,7 +531,7 @@ tableSelect.addEventListener("change", () => {
     return;
   }
   void run(tableSelect, async () => {
-    setNote("Reading columns…");
+    setNote("Setting up columns…");
     if (!settingsOpen) reviewing = true;
     adopt(await send("AIRTABLE_SELECT_TABLE", { baseId: baseSelect.value, tableId: tableSelect.value }));
     $("step-table").classList.remove("open");
@@ -540,7 +543,9 @@ tableSelect.addEventListener("change", () => {
       ? `${config.peopleMismatch.via} links people in ${config.peopleMismatch.name}. Pick ${config.peopleMismatch.name} instead.`
       : config.problem
         ? "Pick the column that holds LinkedIn URLs."
-        : `${mappedCount()} fields mapped for ${config.tableName}. Change any below.`, Boolean(config.problem));
+        : config.columnsError
+          ? `${mappedCount()} fields mapped. Couldn't create the rest: ${config.columnsError} Press Create missing to try again.`
+          : `${mappedCount()} fields mapped for ${config.tableName}. Change any below.`, Boolean(config.problem || config.columnsError));
   }).finally(() => {
     // A pick that didn't take: the list shows what's really set, so it can be picked again.
     if (config?.tableId !== tableSelect.value) tableSelect.value = config?.tableId || "";

@@ -33,7 +33,7 @@ function profileRecord(index) {
 }
 
 function network(airtable, { connections = CONNECTIONS, slowMs = () => 0 } = {}) {
-  const linkedin = { profileRequests: 0 };
+  const linkedin = { profileRequests: 0, connections };
   const fetchImpl = async (input, init = {}) => {
     const url = String(input);
     if (url.startsWith("https://api.airtable.com/")) return airtable.handle(input, init);
@@ -57,7 +57,7 @@ function network(airtable, { connections = CONNECTIONS, slowMs = () => 0 } = {})
     if (url.includes("/voyager/api/relationships/dash/connections")) {
       const start = Number(new URL(url).searchParams.get("start")) || 0;
       return json({
-        elements: Array.from({ length: Math.max(0, Math.min(100, connections - start)) }, (_, offset) => start + offset).map((index) => ({
+        elements: Array.from({ length: Math.max(0, Math.min(100, linkedin.connections - start)) }, (_, offset) => start + offset).map((index) => ({
           entityUrn: `urn:li:fsd_connection:ACoAA${index}`,
           connectedMemberResolutionResult: {
             entityUrn: urnFor(index),
@@ -68,7 +68,7 @@ function network(airtable, { connections = CONNECTIONS, slowMs = () => 0 } = {})
           },
           createdAt: Date.UTC(2023, 10, 14),
         })),
-        paging: { start, count: 100, total: connections },
+        paging: { start, count: 100, total: linkedin.connections },
       });
     }
     return json({});
@@ -660,6 +660,65 @@ test("a test sync after a real one doesn't switch the schedule off", async () =>
       return status?.completed || status?.failed || status?.skipped ? status : null;
     }, "the schedule to act", 60_000);
     assert.notEqual(soft.skipped, "no_initial_sync", "a test sync turned the schedule off");
+  } finally {
+    await send({ type: "CANCEL_SYNC" }).catch(() => {});
+    restore();
+  }
+});
+
+test("the schedule is armed, and each sync after it adds only who's new: no duplicates, even of rows added by hand", async () => {
+  (await import("../lib/airtable-sink.js")).forgetTableState();
+  const airtable = fakeAirtable();
+  const { linkedin, fetchImpl } = network(airtable, { connections: 5 });
+  const { store, send, fireAlarm, calls, restore } = await bootWorker({ fetch: fetchImpl, cookies: signedInToLinkedIn });
+  const people = () => [...airtable.table.records.values()]
+    .map((row) => String(row.fields.fldLinkedIn || "").toLowerCase().match(/\/in\/([^/]+)/)?.[1]);
+  const assertOneRowEach = (count, when) => {
+    assert.equal(people().length, count, `${when}: wrong number of rows`);
+    assert.equal(new Set(people()).size, count, `${when}: a person has two rows`);
+  };
+  const fullSync = async () => {
+    store.set("capture_progress", { status: "idle" });
+    const started = await send({ type: "START_CAPTURE", site: "linkedin", mode: "full" });
+    assert.equal(started.error, undefined, started.error);
+    const done = await until(() => ["complete", "error"].includes(store.get("capture_progress")?.status) && store.get("capture_progress"), "the full sync", 60_000);
+    assert.equal(done.status, "complete", done.message);
+  };
+  const scheduledSync = async () => {
+    store.set("capture_progress", { status: "idle" });
+    store.delete("earthos_soft_sync_status");
+    fireAlarm("earthos-soft-sync");
+    const status = await until(() => {
+      const value = store.get("earthos_soft_sync_status");
+      return value?.completed || value?.failed || value?.skipped ? value : null;
+    }, "the scheduled sync", 60_000);
+    assert.equal(status.completed, true, JSON.stringify(status));
+  };
+  try {
+    await send({ type: "AIRTABLE_CONNECT", token: "patTESTTOKEN.0123456789abcdef" });
+    await send({ type: "AIRTABLE_SELECT_TABLE", baseId: BASE_ID, tableId: TABLE_ID });
+    await fullSync();
+    assertOneRowEach(5, "first full sync");
+
+    const armed = calls.filter(([name, [alarm]]) => name === "alarms.create" && alarm === "earthos-soft-sync");
+    assert.ok(armed.length > 0, "the soft sync was never scheduled");
+    assert.equal(armed.at(-1)[1][1].periodInMinutes, 60, "soft sync ships hourly");
+
+    // Three new connections; a teammate typed one of them into Airtable first, in their own URL style.
+    linkedin.connections = 8;
+    airtable.table.records.set("recBYHANDADA00006", { id: "recBYHANDADA00006", fields: { fldLinkedIn: "linkedin.com/in/Ada-Number-6/" } });
+    await scheduledSync();
+    assertOneRowEach(8, "scheduled soft sync");
+    assert.equal(airtable.table.records.get("recBYHANDADA00006").fields.fldName, "Ada Number6", "the hand-added row wasn't filled in");
+
+    // Another by hand, then full and scheduled syncs back to back.
+    linkedin.connections = 9;
+    airtable.table.records.set("recBYHANDADA00008", { id: "recBYHANDADA00008", fields: { fldLinkedIn: "https://www.linkedin.com/in/ada-number-8" } });
+    await fullSync();
+    assertOneRowEach(9, "full sync after a hand-added row");
+    await scheduledSync();
+    await fullSync();
+    assertOneRowEach(9, "syncing an unchanged network again");
   } finally {
     await send({ type: "CANCEL_SYNC" }).catch(() => {});
     restore();

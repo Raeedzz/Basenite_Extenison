@@ -34,6 +34,7 @@ import { isPlaceholderImage } from "../lib/airtable-fields.js";
 import { enrichmentWalked } from "../lib/enrichment-progress.js";
 import { stageMessage, waitMessage } from "../lib/progress-copy.js";
 import {
+  bufferedResponse,
   getCsrfToken,
   linkedinUrl as voyagerUrl,
   LinkedInSessionError,
@@ -906,7 +907,10 @@ const engine = (function () {
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
     activeAbortControllers.add(ctrl);
     try {
-      return await fetch(voyagerUrl(url), { ...options, signal: ctrl.signal, credentials: "include" });
+      const response = await fetch(voyagerUrl(url), { ...options, signal: ctrl.signal, credentials: "include" });
+      // The timer covers the body too: LinkedIn can send headers and then stall,
+      // and an unguarded body read waits forever.
+      return await bufferedResponse(response);
     } catch (err) {
       if (err?.name === "AbortError") {
         if (runtimeState.cancelRequested) throw new Error("Sync canceled");
@@ -3744,6 +3748,8 @@ const engine = (function () {
               : null,
           };
         }
+        // Opening the import re-reads the Airtable tables, which takes a while on a big base.
+        sendProgress("Reading your Airtable table to match people…");
         const created = await openImport();
         progress.importId = created.import.id;
         await saveProgress(progress);

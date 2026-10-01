@@ -59,3 +59,38 @@ test("a field you unmapped yourself stays unmapped; one never offered is mapped 
   const added = [...PEOPLE_FIELDS, { id: "fldNETWORK0000001", name: "Network", type: "singleSelect", options: { choices: [] } }];
   assert.equal(offerNewMappings(added, suggested, withoutNetwork.mappingSeen).mapping.inNetwork, "fldNETWORK0000001");
 });
+
+test("Known by follows the LinkedIn account signed in, not the token's owner", async () => {
+  const sakib = { id: COLLEAGUE, email: "sakib@basanite.com", name: "Sakib" };
+  const { base } = setup({
+    [PEOPLE]: [{ id: "recSEENBYSAKIB001", fields: { [P.name]: "Old", [P.linkedin]: "https://www.linkedin.com/in/old", [P.knownBy]: [sakib] } }],
+  });
+  // Raeed's token, Sakib's LinkedIn.
+  store.set("linkedin_account", { memberId: "111", name: "Sakib Rahman", email: "sakib.r@gmail.com", checkedAt: Date.now() });
+  await sink.writePeople([person("met-by-sakib")]);
+  const row = base.rows(PEOPLE).find((candidate) => candidate.fields[P.name] === "Person met-by-sakib");
+  assert.deepEqual(knownBy(row), [COLLEAGUE], "credited to the token's owner, not the LinkedIn account syncing");
+});
+
+test("who a LinkedIn account is in Airtable", async () => {
+  const { collaboratorFor, syncUserFor } = await import("../lib/airtable-sink.js");
+  const raeed = { id: ME, email: "raeedz@gmail.com", name: "Raeed Z" };
+  const sakib = { id: COLLEAGUE, email: "sakib@basanite.com", name: "Sakib" };
+  const people = [raeed, sakib];
+  assert.equal(collaboratorFor({ name: "Raeed Zaman" }, people), raeed, "a shortened last name");
+  assert.equal(collaboratorFor({ name: "Sakib Rahman" }, people), sakib, "a first name only");
+  assert.equal(collaboratorFor({ name: "Nobody Else", email: "SAKIB@basanite.com" }, people), sakib, "email wins");
+  assert.equal(collaboratorFor({ name: "Sakib Rahman" }, [sakib, { id: "usrOTHERSAKIB0001", name: "Sakib" }]), null, "two fit: no guess");
+  assert.equal(collaboratorFor({ name: "Rae Zaman" }, people), null);
+
+  const token = { userId: ME, userEmail: "raeedz@gmail.com" };
+  assert.deepEqual(syncUserFor(token, null, people), { id: ME }, "no LinkedIn account known: the token's owner");
+  assert.deepEqual(syncUserFor(token, { name: "Sakib Rahman" }, people), { id: COLLEAGUE });
+  assert.deepEqual(syncUserFor(token, { name: "Raeed Zaman", email: "raeedz@gmail.com" }, []), { id: ME });
+  assert.deepEqual(syncUserFor(token, { name: "New Person", email: "new@x.com" }, people), { email: "new@x.com" });
+  assert.equal(syncUserFor(token, { name: "New Person" }, people), null, "an unknown LinkedIn account is never credited to the token's owner");
+  assert.deepEqual(syncUserFor({ ...token, syncAsEmail: "ops@x.com" }, { name: "Sakib Rahman" }, people), { email: "ops@x.com" });
+  const blockedForNew = { ...token, knownByBlocked: true, knownByBlockedFor: "new@x.com" };
+  assert.equal(syncUserFor(blockedForNew, { name: "New Person", email: "new@x.com" }, people), null);
+  assert.deepEqual(syncUserFor(blockedForNew, { name: "Sakib Rahman" }, people), { id: COLLEAGUE }, "one person's block stopped another");
+});

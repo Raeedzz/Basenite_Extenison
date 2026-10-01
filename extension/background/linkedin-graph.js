@@ -14,6 +14,7 @@
  */
 
 import {
+  bufferedResponse,
   getCsrfToken,
   linkedinUrl as voyagerUrl,
   LinkedInSessionError,
@@ -168,7 +169,8 @@ const engine = (function () {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
-      return await fetch(voyagerUrl(url), { ...options, signal: controller.signal });
+      // Body included: a stalled body would otherwise outlive the timer.
+      return await bufferedResponse(await fetch(voyagerUrl(url), { ...options, signal: controller.signal }));
     } catch (err) {
       if (err && err.name === "AbortError") throw new Error("TIMEOUT");
       throw err;

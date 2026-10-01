@@ -184,3 +184,68 @@ export async function assertLinkedInSession() {
   }
   return csrfToken;
 }
+
+export const LINKEDIN_ACCOUNT_KEY = "linkedin_account";
+const ACCOUNT_MAX_AGE_MS = 10 * 60_000;
+
+/**
+ * Who is signed in to LinkedIn in this browser: { memberId, name, email }.
+ * Known by follows this person, not whoever owns the Airtable token, so a
+ * teammate syncing through a shared token is credited as themselves. Re-read
+ * when stale or when the session probe has seen a different member; the last
+ * answer stands while LinkedIn can't be reached. Email is best effort.
+ */
+export async function linkedInAccount() {
+  const { [LINKEDIN_ACCOUNT_KEY]: stored } = await chrome.storage.local.get(LINKEDIN_ACCOUNT_KEY);
+  const session = await readLinkedInSessionState().catch(() => ({}));
+  const sameMember = !session?.memberId || session.memberId === stored?.memberId;
+  if (stored && sameMember && Date.now() - Number(stored.checkedAt || 0) < ACCOUNT_MAX_AGE_MS) return stored;
+  try {
+    const csrfToken = await getCsrfToken();
+    const get = async (path, accept) => {
+      const response = await fetch(linkedinUrl(path), {
+        credentials: "include",
+        headers: linkedinApiHeaders(csrfToken, { accept }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!response.ok) throw new LinkedInSessionError(`LinkedIn answered ${response.status}`, "unknown", response.status);
+      return response.json();
+    };
+    const mini = (await get("/voyager/api/me", "application/json"))?.miniProfile;
+    const memberId = typeof mini?.entityUrn === "string" ? mini.entityUrn.split(":").pop() : null;
+    if (!memberId) return stored && sameMember ? stored : null;
+    const name = [mini.firstName, mini.lastName].filter(Boolean).join(" ").trim() || null;
+    let email = null;
+    if (mini.publicIdentifier) {
+      const contact = await get(
+        `/voyager/api/voyagerIdentityDashProfiles?q=memberIdentity&memberIdentity=${encodeURIComponent(mini.publicIdentifier)}`
+          + "&decorationId=com.linkedin.voyager.dash.deco.identity.profile.ProfileContactInfo-15",
+        "application/vnd.linkedin.normalized+json+2.1",
+      ).catch(() => null);
+      const self = (contact?.included || []).find((entity) => entity?.publicIdentifier === mini.publicIdentifier);
+      const address = self?.emailAddress?.emailAddress;
+      email = typeof address === "string" && address.includes("@") ? address.trim().toLowerCase() : null;
+    }
+    const account = { memberId, name, email, checkedAt: Date.now() };
+    await chrome.storage.local.set({ [LINKEDIN_ACCOUNT_KEY]: account });
+    return account;
+  } catch {
+    return stored && sameMember ? stored : null;
+  }
+}
+
+const NULL_BODY_STATUSES = new Set([101, 103, 204, 205, 304]);
+
+/**
+ * The response with its body already read, so a caller's abort timer covers
+ * the body as well as the headers. Reading it later, after the timer is
+ * cleared, waits forever when LinkedIn sends headers and then stalls.
+ */
+export async function bufferedResponse(response) {
+  const body = await response.arrayBuffer();
+  return new Response(NULL_BODY_STATUSES.has(response.status) ? null : body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}

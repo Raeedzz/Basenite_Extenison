@@ -19,6 +19,7 @@ import {
   extractPerson,
   fingerprint,
   linkedinKey,
+  normalizeName,
   offerNewMappings,
   planCells,
   SOURCE_FIELDS,
@@ -36,6 +37,7 @@ import {
   updateRecords,
 } from "./airtable-client.js";
 import { dropBrokenImages } from "./image-check.js";
+import { linkedInAccount } from "./linkedin-session.js";
 import {
   extractLinked,
   linkedReady,
@@ -216,7 +218,9 @@ async function loadState(config) {
   for (const key of keys) {
     for (const [person, row] of Object.entries(stored[key] || {})) rows.set(person, row);
   }
-  state = { table, rows, indexedAt: Number(stored[metaKey]?.indexedAt) || 0, dirty: new Set() };
+  // null: an index read before collaborators were kept; the next write reads them.
+  const collaborators = Array.isArray(stored[metaKey]?.collaborators) ? stored[metaKey].collaborators : null;
+  state = { table, rows, indexedAt: Number(stored[metaKey]?.indexedAt) || 0, collaborators, dirty: new Set() };
   if (stored[metaKey]?.photos !== PHOTO_MARKS) {
     for (const [person, row] of rows) {
       if (!row.h?.photo) continue;
@@ -242,7 +246,7 @@ async function persist() {
   if (!state || state.dirty.size === 0) return;
   const buckets = Array.from({ length: BUCKETS }, () => ({}));
   for (const [person, row] of state.rows) buckets[bucketOf(person)][person] = row;
-  const writes = { [`${ROWS_PREFIX}:${state.table}:meta`]: { indexedAt: state.indexedAt, photos: PHOTO_MARKS } };
+  const writes = { [`${ROWS_PREFIX}:${state.table}:meta`]: { indexedAt: state.indexedAt, photos: PHOTO_MARKS, collaborators: state.collaborators || [] } };
   for (const bucket of state.dirty) writes[bucketKey(state.table, bucket)] = buckets[bucket];
   state.dirty.clear();
   await chrome.storage.local.set(writes);
@@ -306,12 +310,24 @@ async function adoptAddedRows(config, keys, writeStartedAt) {
 /** Match every row in the table to a person by its LinkedIn URL. */
 async function rebuildIndex(config) {
   const keyField = config.mapping.linkedinUrl;
-  const records = await listRecords(config.token, config.baseId, config.tableId, { fieldIds: [keyField] });
+  // Airtable lists a base's collaborators only on Enterprise, so the people
+  // already in Known by stand in: read in the same pass. Only that column —
+  // Created by and Last modified by on every row made each page much heavier.
+  const knownBy = fieldsById(config).get(config.mapping?.knownBy);
+  const people = knownBy && COLLABORATOR_TYPES.has(knownBy.type) ? [knownBy.id] : [];
+  const records = await listRecords(config.token, config.baseId, config.tableId, { fieldIds: [keyField, ...people] });
   const seen = new Map();
+  const collaborators = new Map();
   for (const record of records) {
     const person = linkedinKey(record.fields?.[keyField]);
     if (person && !seen.has(person)) seen.set(person, record.id);
+    for (const fieldId of people) {
+      for (const user of [record.fields?.[fieldId]].flat()) {
+        if (user?.id && !collaborators.has(user.id)) collaborators.set(user.id, { id: user.id, email: user.email || null, name: user.name || null });
+      }
+    }
   }
+  state.collaborators = [...collaborators.values()];
   for (const [person, recordId] of seen) {
     const row = state.rows.get(person);
     // A different record than the one written to means the fingerprints
@@ -335,10 +351,16 @@ async function rebuildIndex(config) {
  * Bring schema and index up to date. `force` rebuilds the index regardless of
  * age — a full sync does, so it starts from what the table holds right now.
  */
-export async function prepareTable({ force = false } = {}) {
+/**
+ * `freshSchema` re-reads the columns only: one call. `force` re-reads every
+ * row of every table too, which on a big base is minutes of paging, so a sync
+ * leaves rows to the 24-hour index and the write path (adoptAddedRows finds
+ * rows added by hand, recoverable() rows deleted by hand).
+ */
+export async function prepareTable({ force = false, freshSchema = force } = {}) {
   return queue(async () => {
     let config = await requireConfig();
-    if (force || Date.now() - Number(config.schemaAt || 0) > SCHEMA_MAX_AGE_MS) {
+    if (freshSchema || Date.now() - Number(config.schemaAt || 0) > SCHEMA_MAX_AGE_MS) {
       config = await refreshSchema(config);
       const problem = configProblem(config);
       if (problem) throw new AirtableError(problem, { status: 401 });
@@ -655,15 +677,52 @@ const UNION_KEYS = new Set(SOURCE_FIELDS.filter((source) => source.union).map((s
 // Blank-only: never replaces anything, not even what the extension wrote itself.
 const BLANK_ONLY_KEYS = new Set(SOURCE_FIELDS.filter((source) => source.fill === "blank").map((source) => source.key));
 
+const COLLABORATOR_TYPES = new Set(["multipleCollaborators", "singleCollaborator", "createdBy", "lastModifiedBy"]);
+
 /**
- * Who "Known by" gets: the Airtable user the token belongs to, or the email
- * set as an override for a shared token. Nothing once Airtable has said this
- * account can't be set there.
+ * The collaborator a LinkedIn account is: same email, else the same name (or
+ * a shorter form of it: "Sakib" or "Raeed Z" for "Raeed Zaman"), when only one fits.
  */
-export function syncUserFor(config) {
-  if (config.knownByBlocked) return null;
-  if (config.syncAsEmail) return { email: config.syncAsEmail };
-  return config.userId ? { id: config.userId } : null;
+export function collaboratorFor(account, collaborators = []) {
+  const email = String(account?.email || "").toLowerCase();
+  if (email) {
+    const hit = collaborators.find((user) => String(user.email || "").toLowerCase() === email);
+    if (hit) return hit;
+  }
+  const full = normalizeName(account?.name || "").split(" ").filter(Boolean);
+  if (!full.length) return null;
+  const fits = (user) => {
+    const name = normalizeName(user.name || "").split(" ").filter(Boolean);
+    if (!name.length || name[0] !== full[0] || name.length > full.length) return false;
+    return name.length === 1 || full.at(-1).startsWith(name.at(-1));
+  };
+  const exact = collaborators.filter((user) => normalizeName(user.name || "") === full.join(" "));
+  if (exact.length === 1) return exact[0];
+  const loose = collaborators.filter(fits);
+  return loose.length === 1 ? loose[0] : null;
+}
+
+/**
+ * Who "Known by" gets: whoever is signed in to LinkedIn here, as the base
+ * collaborator they match, or by their LinkedIn email. The Airtable account
+ * the token belongs to is only the answer when the LinkedIn account is it, or
+ * when there's no LinkedIn account to go on. "Sync as" overrides all of it.
+ */
+export function syncUserFor(config, account = null, collaborators = []) {
+  let user;
+  if (config.syncAsEmail) user = { email: config.syncAsEmail };
+  else if (!account) user = config.userId ? { id: config.userId } : null;
+  else if (account.email && config.userId && account.email === String(config.userEmail || "").toLowerCase()) user = { id: config.userId };
+  else {
+    const match = collaboratorFor(account, collaborators);
+    user = match ? { id: match.id } : account.email ? { email: account.email } : null;
+  }
+  if (!user || (config.knownByBlocked && (!config.knownByBlockedFor || config.knownByBlockedFor === userKey(user)))) return null;
+  return user;
+}
+
+function userKey(user) {
+  return user?.id || String(user?.email || "").toLowerCase() || null;
 }
 
 function sameUser(left, right) {
@@ -690,9 +749,15 @@ function isCollaboratorError(error, config, group = []) {
 async function blockKnownBy(config) {
   if (config.knownByBlocked) return;
   config.knownByBlocked = true;
+  // Only this person is blocked: another LinkedIn account signing in here gets its own try.
+  const who = config.knownByUser;
+  config.knownByBlockedFor = userKey(who);
   await writeConfig({
     knownByBlocked: true,
-    notice: `Your Airtable account isn't a collaborator on ${config.baseName || "this base"}, so Known by can't be set. Ask the base owner to invite you.`,
+    knownByBlockedFor: config.knownByBlockedFor,
+    notice: who?.email && who.email !== config.userEmail
+      ? `${who.email} (your LinkedIn email) isn't a collaborator on ${config.baseName || "this base"}, so Known by can't be set. Ask the base owner to invite it, or set Sync as to your Airtable email.`
+      : `Your Airtable account isn't a collaborator on ${config.baseName || "this base"}, so Known by can't be set. Ask the base owner to invite you.`,
   });
   LOG("Known by rejected: not a collaborator; skipping it from now on");
 }
@@ -851,7 +916,8 @@ export function writePeople(rows, { source = null, degree = null } = {}) {
     // created rows the extension never recorded: re-read every table first.
     const interrupted = Boolean((await chrome.storage.local.get(WRITE_OPEN_KEY))[WRITE_OPEN_KEY]);
     if (interrupted) LOG("The last write didn't finish; re-reading tables before writing");
-    if (interrupted || Date.now() - state.indexedAt > INDEX_MAX_AGE_MS) await rebuildIndex(config);
+    const needCollaborators = Boolean(config.mapping?.knownBy) && !state.collaborators;
+    if (interrupted || needCollaborators || Date.now() - state.indexedAt > INDEX_MAX_AGE_MS) await rebuildIndex(config);
     const ready = linkedReady(config.linked);
     const linkedOn = ready.companies || ready.schools;
     if (linkedOn) await prepareLinked(config, { force: interrupted });
@@ -864,6 +930,10 @@ export function writePeople(rows, { source = null, degree = null } = {}) {
     };
     const now = new Date();
     const stamp = stampFor(config);
+    const syncUser = config.mapping?.knownBy
+      ? syncUserFor(config, await linkedInAccount().catch(() => null), state.collaborators || [])
+      : null;
+    config.knownByUser = syncUser;
     const people = [];
     for (const row of rows) {
       const person = extractPerson(row, { source, degree, now });
@@ -873,7 +943,6 @@ export function writePeople(rows, { source = null, degree = null } = {}) {
       }
       // Only ever reaches a create: the marker is create-only.
       person.createdStamp = stamp?.value || "";
-      const syncUser = syncUserFor(config);
       if (syncUser) person.knownBy = [syncUser];
       if (linkedOn) {
         const linked = extractLinked(row);

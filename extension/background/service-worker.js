@@ -28,7 +28,7 @@ import {
   whoami,
 } from "../lib/airtable-client.js";
 import {
-  canMap, isWritable, newFieldSpec, offerNewMappings, seenMappings, SOURCE_FIELD_BY_KEY, suggestMapping, suggestStampValue,
+  canMap, isWritable, newFieldSpec, offerNewMappings, seenMappings, SOURCE_FIELD_BY_KEY, SOURCE_FIELDS, suggestMapping, suggestStampValue,
 } from "../lib/airtable-fields.js";
 import {
   linkedReady,
@@ -58,6 +58,8 @@ import {
 import {
   assertLinkedInSession,
   LINKEDIN_ORIGIN,
+  LINKEDIN_ACCOUNT_KEY,
+  linkedInAccount,
   LinkedInSessionError,
   readLinkedInSessionState,
 } from "../lib/linkedin-session.js";
@@ -849,6 +851,8 @@ async function handleMessage(message) {
 
     case "AIRTABLE_GET_CONFIG":
       await repairPeopleTable("panel opened").catch(() => {});
+      // So the panel can say whose Known by this is before the first sync.
+      void linkedInAccount().catch(() => {});
       return publicConfig(await readConfig());
 
     case "AIRTABLE_SET_SYNC_AS": {
@@ -870,7 +874,7 @@ async function handleMessage(message) {
     }
 
     case "AIRTABLE_SELECT_TABLE":
-      return handleAirtableSelectTable(message);
+      return handleAirtableSelectTable({ ...message, makeColumns: true });
 
     case "AIRTABLE_SAVE_MAPPING":
       return handleAirtableSaveMapping(message.mapping, message.stampValue);
@@ -947,8 +951,10 @@ async function repairPeopleTable(reason) {
 
 /** The config as the panel sees it: never the token itself. */
 async function publicConfig(config) {
-  const stored = await chrome.storage.local.get(LAST_WRITE_KEY).catch(() => ({}));
+  const stored = await chrome.storage.local.get([LAST_WRITE_KEY, LINKEDIN_ACCOUNT_KEY]).catch(() => ({}));
   return {
+    // Known by follows this account (airtable-sink syncUserFor), not the token's owner.
+    linkedinName: stored[LINKEDIN_ACCOUNT_KEY]?.name || null,
     connected: Boolean(config.token),
     tokenHint: config.token ? `…${config.token.slice(-4)}` : null,
     userEmail: config.userEmail || null,
@@ -1014,10 +1020,26 @@ async function handleAirtableConnect(rawToken) {
       ...identity,
       baseId: null, baseName: null, tableId: null, tableName: null, fields: [], mapping: {},
     });
-  return afterConfigChange(config);
+  if (keepTable) return afterConfigChange(config);
+  // A new token is set up whole: the people table it can write to, its columns, its linked tables.
+  const pick = await bestPeopleTable(token, bases).catch(() => null);
+  return pick ? handleAirtableSelectTable({ ...pick, makeColumns: true }) : afterConfigChange(config);
 }
 
-async function handleAirtableSelectTable({ baseId, tableId }) {
+const MAX_BASES_SCANNED = 10;
+
+/** The writable base and table people most likely go into, by the table's name and what links to it. */
+async function bestPeopleTable(token, bases) {
+  const writable = bases.filter((base) => ["create", "edit", "owner"].includes(base.permissionLevel)).slice(0, MAX_BASES_SCANNED);
+  let best = null;
+  for (const base of writable) {
+    const found = suggestPeopleTable(await listTables(token, base.id));
+    if (found && (!best || found.score > best.score)) best = { baseId: base.id, tableId: found.id, score: found.score };
+  }
+  return best && { baseId: best.baseId, tableId: best.tableId };
+}
+
+async function handleAirtableSelectTable({ baseId, tableId, makeColumns = false }) {
   await assertIdle();
   const token = await airtableToken();
   const config = await readConfig();
@@ -1067,7 +1089,19 @@ async function handleAirtableSelectTable({ baseId, tableId }) {
   });
   // The marker's value follows the column the mapping just chose.
   const stampValue = stampValueFor(fields, next.mapping, saved?.stampValue || null);
-  return afterConfigChange(stampValue === next.stampValue ? next : await writeConfig({ stampValue }));
+  let ready = stampValue === next.stampValue ? next : await writeConfig({ stampValue });
+  if (saved || !makeColumns) return afterConfigChange(ready);
+  // A table picked fresh in the panel gets a column for every field it lacks, so
+  // nothing starts on Skip. Source stays a choice made by hand.
+  // A token that can't make columns still gets the table; the panel says why.
+  let columnsError = null;
+  try {
+    ready = await createColumns(token, ready, SOURCE_FIELDS.filter((source) => source.autoMap !== false).map((source) => source.key));
+  } catch (error) {
+    columnsError = error?.message || String(error);
+    ready = await refreshSchema(await readConfig()).catch(() => readConfig());
+  }
+  return { ...(await afterConfigChange(ready)), ...(columnsError ? { columnsError } : {}) };
 }
 
 /** The marker value to keep: the one asked for if it's a real choice, else the suggested one. */
@@ -1144,12 +1178,16 @@ async function handleAirtableSuggestLinked(only) {
   return afterConfigChange(await writeConfig({ linked, linkedChosen: true }));
 }
 
-/** Make a column for each unmapped capture field, then map it. */
 async function handleAirtableCreateFields(keys) {
   await assertIdle();
   const token = await airtableToken();
-  let config = await readConfig();
+  const config = await readConfig();
   if (!config.baseId || !config.tableId) throw new Error("Pick a table first.");
+  return afterConfigChange(await createColumns(token, config, keys));
+}
+
+/** Make a column for each unmapped capture field, then map it. */
+async function createColumns(token, config, keys) {
   // Columns made by an earlier attempt that stopped partway are in the table now.
   config = await refreshSchema(config);
   const taken = new Set((config.fields || []).map((field) => field.name.toLowerCase()));
@@ -1160,8 +1198,9 @@ async function handleAirtableCreateFields(keys) {
   try {
     for (const key of wanted) {
       const label = SOURCE_FIELD_BY_KEY.get(key).label;
-      let name = label;
-      for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${label} ${n}`;
+      // A same-named column already there (a linked "Education", a lookup) holds something else.
+      let name = taken.has(label.toLowerCase()) ? `${label} (LinkedIn)` : label;
+      for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${label} (LinkedIn) ${n}`;
       try {
         const created = await createField(token, config.baseId, config.tableId, newFieldSpec(key, name));
         mapping[key] = created.id;
@@ -1177,7 +1216,7 @@ async function handleAirtableCreateFields(keys) {
     // Whatever was made stays mapped, even if a later column failed.
     config = await writeConfig({ mapping });
   }
-  return afterConfigChange(await refreshSchema(config));
+  return refreshSchema(config);
 }
 
 // ─── Shared LinkedIn gate ────────────────────────────────────────────────────

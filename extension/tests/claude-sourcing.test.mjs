@@ -225,6 +225,8 @@ test("capture_search pages every result, then enriches them all into People", as
     assert.equal(again.nextStart, 3, "the rest starts right after the last one added");
   } finally {
     await worker.send({ type: "CANCEL_SYNC" }).catch(() => {});
+    // The second search's enrich outlives this worker in the test process: let it stop first.
+    await until(() => !isBulkEnrichRunning(), "the enrich to stop");
     worker.restore();
   }
 });

@@ -120,10 +120,10 @@ function lookup(importId) {
 }
 
 async function createPeopleImport({ source = "linkedin", expectedRows, sourceCursor, clientImportKey } = {}) {
-  // A network sync matches against the table as it is right now; a full one
-  // re-reads it outright, so rows added or deleted by hand are seen.
+  // A full sync starts from the table's current columns. Its rows come from the
+  // 24-hour index: re-reading every table here held the sync up for minutes.
   if (sourceCursor?.mode === "linkedin_network_connections") {
-    await prepareTable({ force: sourceCursor.syncMode !== "soft" && !sourceCursor.nextSequence });
+    await prepareTable({ freshSchema: sourceCursor.syncMode !== "soft" && !sourceCursor.nextSequence });
   }
   return withLedger(async (imports) => {
     if (clientImportKey) {

@@ -4,7 +4,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { airtableConfig, fakeAirtable } from "./helpers/fake-airtable.mjs";
+import { airtableConfig, fakeAirtable, MAPPING, TABLE_FIELDS, TABLE_ID } from "./helpers/fake-airtable.mjs";
 
 const store = new Map();
 globalThis.chrome = {
@@ -182,4 +182,43 @@ test("mutual and company captures land on the right rows", async () => {
   const result = await api.captureCompanyPeople({ company: "Acme", people: [person("acme-1"), person("acme-2")] });
   assert.equal(result.accepted, 2);
   assert.equal(airtable.byLinkedIn().get("https://www.linkedin.com/in/acme-1").fields.fldSource, "Company: Acme");
+});
+
+test("a full sync opens without re-reading the table, and still finds rows added or deleted by hand", async () => {
+  const airtable = setup();
+  await sink.writePeople([person("a"), person("gone")]);
+  const handAdded = { id: "recHANDADDED00001", fields: { fldLinkedIn: "https://www.linkedin.com/in/b", fldName: "B by hand" } };
+  airtable.table.records.set(handAdded.id, handAdded);
+  airtable.table.records.delete(airtable.byLinkedIn().get("https://www.linkedin.com/in/gone").id);
+  const from = airtable.log.length;
+  const { import: opened } = await api.createPeopleImport({
+    sourceCursor: { mode: "linkedin_network_connections", syncMode: "full", nextSequence: 0 },
+  });
+  const opening = airtable.log.slice(from);
+  assert.ok(opening.some((entry) => entry.path.endsWith("/tables")), "the columns are re-read");
+  assert.ok(!opening.some((entry) => entry.path.endsWith(TABLE_ID)), "the rows were re-read before the sync could start");
+
+  await api.putPeopleImportChunk(opened.id, 0, [person("b"), person("gone", { bio: "New headline" })]);
+  const rows = [...airtable.table.records.values()].filter((row) => /\/in\/(b|gone)$/.test(row.fields.fldLinkedIn));
+  assert.equal(rows.length, 2, "a hand-added row was duplicated, or a deleted one not recreated");
+  assert.ok(rows.some((row) => row.id === handAdded.id), "the hand-added row wasn't adopted");
+});
+
+test("the index reads Known by for collaborators, not every collaborator column", async () => {
+  const fields = [
+    ...TABLE_FIELDS,
+    { id: "fldKnownBy", name: "Known by", type: "multipleCollaborators" },
+    { id: "fldCreatedBy", name: "Created by", type: "createdBy" },
+    { id: "fldEditedBy", name: "Last modified by", type: "lastModifiedBy" },
+  ];
+  const airtable = setup({ fields });
+  store.set("airtable_config", airtableConfig({ fields, mapping: { ...MAPPING, knownBy: "fldKnownBy" } }));
+  const asked = [];
+  globalThis.fetch = (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname.endsWith(TABLE_ID) && !url.searchParams.get("filterByFormula")) asked.push(url.searchParams.getAll("fields[]"));
+    return airtable.handle(input, init);
+  };
+  await sink.prepareTable({ force: true });
+  assert.deepEqual(asked, [["fldLinkedIn", "fldKnownBy"]]);
 });
